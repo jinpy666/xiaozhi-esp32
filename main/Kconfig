@@ -1,0 +1,11 @@
+menu "Product Branding"
+
+    config PRODUCT_BRAND_AP_PREFIX
+        string "Wi-Fi configuration AP SSID prefix"
+        default "Xiaozhi"
+
+    config PRODUCT_BRAND_BLE_NAME
+        string "BluFi BLE device name"
+        default "Xiaozhi-Blufi"
+
+endmenu

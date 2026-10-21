@@ -1,0 +1,50 @@
+name: Brand Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_url:
+        description: Upstream repository URL for the sync check (optional)
+        type: string
+        required: false
+        default: https://github.com/78/xiaozhi-esp32.git
+      upstream_branch:
+        description: Upstream branch for the sync check
+        type: string
+        required: false
+        default: main
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  brand-audit:
+    name: Brand audit and upstream sync check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Test product tooling
+        run: |
+          python3 -m unittest discover -s scripts/tests -p "test_brand_audit.py" -v
+          python3 -m unittest discover -s scripts/tests -p "test_check_upstream.py" -v
+
+      - name: Brand audit (sources)
+        run: python3 scripts/product/brand_audit.py
+
+      - name: Upstream brand-sensitive sync check
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+        run: bash scripts/product/check_upstream.sh "$UPSTREAM_URL" "$UPSTREAM_BRANCH"

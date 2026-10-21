@@ -19,6 +19,48 @@ CHIP_IDS = {
     "esp32s31": 0x20,
 }
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PROJECT_NAME = "xiaozhi"
+
+
+def _cmake_set_value(paths, variable):
+    """Return the quoted value of `set(VARIABLE "value")`, or None. Never raises."""
+    pattern = re.compile(r'^\s*set\(' + re.escape(variable) + r'\s+"([^"]*)"', re.MULTILINE)
+    for path in paths:
+        try:
+            match = pattern.search(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if match:
+            return match.group(1)
+    return None
+
+
+def get_project_name():
+    """Resolve the firmware project name from CMakeLists.txt/brand.cmake."""
+    cmake_lists = REPO_ROOT / "CMakeLists.txt"
+    brand = REPO_ROOT / "product/brand.cmake"
+    try:
+        match = re.search(r'^project\(([^)\s]+)\)', cmake_lists.read_text(encoding="utf-8"),
+                          re.MULTILINE)
+    except OSError:
+        return DEFAULT_PROJECT_NAME
+    if not match:
+        return DEFAULT_PROJECT_NAME
+    name = match.group(1)
+    if name.startswith("${") and name.endswith("}"):
+        # brand.cmake wins over the root CMakeLists.txt fallback default.
+        name = _cmake_set_value([brand, cmake_lists], name[2:-1]) or DEFAULT_PROJECT_NAME
+    return name
+
+
+def get_project_version():
+    """Resolve PROJECT_VER: brand.cmake wins, then root CMakeLists.txt."""
+    version = _cmake_set_value([REPO_ROOT / "product/brand.cmake"], "BRAND_PROJECT_VER")
+    if version:
+        return version
+    return build.get_project_version()
+
 
 def gh_json(repository, endpoint, optional=False):
     result = subprocess.run(
@@ -135,7 +177,7 @@ def verify_assets(manifest, assets_dir):
                 raise ValueError(f"{name}: expected only merged-binary.bin")
             data = archive.read("merged-binary.bin")  # Also verifies ZIP CRC.
         meta = firmware_metadata(data)
-        if meta["version"] != manifest["version"] or meta["project"] != "xiaozhi":
+        if meta["version"] != manifest["version"] or meta["project"] != get_project_name():
             raise ValueError(f"{name}: application version/project mismatch: {meta}")
         sdk_match = re.match(r"v?(\d+)\.(\d+)", meta["idf_version"])
         if not sdk_match or tuple(map(int, sdk_match.groups())) != sdk:
@@ -232,7 +274,7 @@ def main():
     release.add_argument("--make-public", action="store_true")
     args = parser.parse_args()
     if args.command == "prepare":
-        manifest = create_manifest(build.get_project_version(), args.source_sha,
+        manifest = create_manifest(get_project_version(), args.source_sha,
                                    tuple(map(int, args.idf_version.split("."))))
         if args.repository:
             preflight(args.repository, manifest)

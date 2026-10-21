@@ -9,5 +9,10 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
 
-set(PROJECT_VER "2.5.3")
-project(xiaozhi)
+set(BRAND_PROJECT_NAME "xiaozhi")
+set(BRAND_PROJECT_VER "2.5.3")
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/product/brand.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/product/brand.cmake")
+endif()
+set(PROJECT_VER "${BRAND_PROJECT_VER}")
+project(${BRAND_PROJECT_NAME})

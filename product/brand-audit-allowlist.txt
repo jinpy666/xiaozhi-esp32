@@ -1,0 +1,15 @@
+# Brand audit allowlist: one regex per line, '#' comments allowed.
+# A scan hit is ignored when any regex here matches the line text or the file path.
+# Lines containing "tenclass" are ALWAYS reported (hardcoded in brand_audit.py):
+# the upstream CONFIG_OTA_URL default must be overridden when re-branding.
+CONFIG_XIAOZHI_
+XIAOZHI_I2S_PORT
+XIAOZHI_BUILD_STAGES
+menu "Xiaozhi Assistant"
+docs/
+\.md$
+LICENSE
+78/
+main/Kconfig\.projbuild
+# main/Kconfig holds the branding defaults themselves; override via sdkconfig.
+^main/Kconfig$
