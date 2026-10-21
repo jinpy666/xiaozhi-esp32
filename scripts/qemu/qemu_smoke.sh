@@ -26,8 +26,11 @@ exec docker run --rm \
         python3 scripts/build.py "'"$BOARD"'" --name "'"$VARIANT"'" 2>&1 | tail -5
         test -f build/merged-binary.bin
         # QEMU models the flash chip from the drive size; a smaller chip than
-        # CONFIG_ESPTOOLPY_FLASHSIZE trips an init assert. Pad to the built size.
-        FLASH_MB=$(sed -n 's/^CONFIG_ESPTOOLPY_FLASHSIZE="\([0-9]*\)MB"$/\1/p' build/sdkconfig | head -1)
+        # CONFIG_ESPTOOLPY_FLASHSIZE trips an init assert. The textual sdkconfig
+        # lives at the project root (not build/); try the value line, then the
+        # selected choice line, then fall back to 4.
+        FLASH_MB=$(sed -n 's/^CONFIG_ESPTOOLPY_FLASHSIZE="\([0-9]*\)MB"$/\1/p' sdkconfig 2>/dev/null | head -1)
+        [ -z "$FLASH_MB" ] && FLASH_MB=$(sed -n 's/^CONFIG_ESPTOOLPY_FLASHSIZE_\([0-9]*\)MB=y$/\1/p' sdkconfig 2>/dev/null | head -1)
         FLASH_MB="${FLASH_MB:-4}"
         echo "[qemu] padding flash image to ${FLASH_MB}M (CONFIG_ESPTOOLPY_FLASHSIZE)"
         cp build/merged-binary.bin build/qemu-flash.bin
