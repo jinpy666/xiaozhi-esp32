@@ -1,0 +1,26 @@
+name: QEMU Boot Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "main/**"
+      - "scripts/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qemu-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qemu-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build + boot in QEMU (Docker) + milestone assertions
+        run: bash scripts/qemu/qemu_smoke.sh

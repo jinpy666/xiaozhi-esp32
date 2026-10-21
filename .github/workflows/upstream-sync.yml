@@ -1,0 +1,87 @@
+# Scheduled upstream sync: fetches 78/xiaozhi-esp32, creates an isolated
+# sync branch, opens a PR for MANUAL review. Never auto-merges and never
+# force-pushes (see docs/architecture/ README - sync strategy).
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "30 18 * * *" # daily 18:30 UTC = 02:30 (UTC+8)
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream git URL"
+        required: false
+        default: "https://github.com/78/xiaozhi-esp32.git"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: fetch
+        env:
+          UPSTREAM: ${{ inputs.upstream_repo || 'https://github.com/78/xiaozhi-esp32.git' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream main --no-tags
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream is ahead by $BEHIND commits"
+
+      - name: Create sync branch and merge upstream
+        id: sync
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          BRANCH="sync/upstream-${DATE}-${GITHUB_RUN_NUMBER}"
+          git checkout -b "$BRANCH"
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort 2>/dev/null || true
+            echo "::error::Upstream merge conflicts. Reproduce locally: git fetch upstream main && git merge upstream/main, resolve with brand-sensitive files in mind (scripts/product/check_upstream.sh lists them)."
+            exit 1
+          fi
+          git push origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR for manual review
+        if: steps.fetch.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.sync.outputs.branch }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+        run: |
+          SHA=$(git rev-parse --short upstream/main)
+          COMMITS=$(git log --oneline HEAD~1..upstream/main 2>/dev/null | head -30 || true)
+          {
+            echo "## Upstream sync (automated)"
+            echo ""
+            echo "- Upstream \`main\`: \`$SHA\` (+$BEHIND commits)"
+            echo "- **Manual review required** — this PR never auto-merges."
+            echo "- Before merging, run \`bash scripts/product/check_upstream.sh\` and review brand-sensitive files."
+            echo "- Required CI: brand-check, qemu-smoke, build (representative variants)."
+            echo ""
+            echo "<details><summary>Upstream commits</summary>"
+            echo ""
+            echo '```'
+            echo "$COMMITS"
+            echo '```'
+            echo "</details>"
+          } > /tmp/pr-body.md
+          gh pr create --base main --head "$BRANCH" \
+              --title "sync: upstream $SHA (+$BEHIND commits)" \
+              --body-file /tmp/pr-body.md
