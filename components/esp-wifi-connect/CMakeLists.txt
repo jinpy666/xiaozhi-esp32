@@ -73,7 +73,7 @@ endif()
 
 # target_add_binary_data accepts exactly one file per call.
 foreach(portal_text ${PORTAL_TEXT_FILES})
-    target_add_binary_data(${COMPONENT_LIB} "${portal_text}")
+    target_add_binary_data(${COMPONENT_LIB} "${portal_text}" TEXT)
 endforeach()
 foreach(portal_binary ${PORTAL_BINARY_FILES})
     target_add_binary_data(${COMPONENT_LIB} "${portal_binary}" BINARY)
