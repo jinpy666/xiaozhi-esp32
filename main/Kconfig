@@ -8,4 +8,68 @@ menu "Product Branding"
         string "BluFi BLE device name"
         default "Xiaozhi-Blufi"
 
+    config PRODUCT_BRAND_NAME
+        string "Brand name shown on the configuration portal"
+        default ""
+        help
+            Short product/brand name. When empty the portal keeps its stock
+            appearance. Used as the logo alt text and by the default brand
+            configuration served at /brand.js.
+
+    config PRODUCT_BRAND_PORTAL_TITLE
+        string "Configuration portal page title"
+        default ""
+        help
+            Overrides the browser/tab title of the configuration portal page.
+            Leave empty to keep the translated stock title.
+
+    config PRODUCT_BRAND_PORTAL_ACCENT
+        string "Configuration portal accent color (#RRGGBB)"
+        default ""
+        help
+            Primary accent color for buttons and highlights. Empty keeps the
+            stock palette.
+
+    config PRODUCT_BRAND_PORTAL_THEME
+        string "Configuration portal forced theme (dark/light/empty)"
+        default ""
+        help
+            Force the portal color theme. Empty follows the phone/browser
+            system preference; "dark" or "light" pins it.
+
+    config PRODUCT_BRAND_PORTAL_FOOTER
+        string "Configuration portal footer text"
+        default ""
+
+    config PRODUCT_BRAND_PORTAL_SUPPORT_URL
+        string "Configuration portal support/help URL"
+        default ""
+
+    config PRODUCT_BRAND_PORTAL_CONFIG
+        bool "Embed the tenant brand config JSON"
+        default n
+        help
+            Set by scripts/build.py --brand when the tenant profile carries a
+            declarative portal config (i18n overrides, sections, theme, notice,
+            css_vars). The staged file is product/brand_assets/brand_config.json.
+            Do not enable manually without staging that file.
+
+    choice PRODUCT_BRAND_LOGO_FORMAT
+        prompt "Configuration portal logo format"
+        default PRODUCT_BRAND_LOGO_NONE
+        help
+            The logo asset is staged by the product build pipeline at
+            product/brand_assets/logo (see scripts/build.py --brand).
+
+        config PRODUCT_BRAND_LOGO_NONE
+            bool "None (stock Wi-Fi glyph)"
+
+        config PRODUCT_BRAND_LOGO_SVG
+            bool "SVG (product/brand_assets/logo)"
+
+        config PRODUCT_BRAND_LOGO_PNG
+            bool "PNG (product/brand_assets/logo)"
+
+    endchoice
+
 endmenu

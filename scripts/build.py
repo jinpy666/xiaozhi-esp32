@@ -7,6 +7,8 @@ import zipfile
 import argparse
 import re
 import subprocess
+import gzip
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 from pathlib import Path
@@ -48,12 +50,27 @@ def _emit_build_stage(stage: str) -> None:
 
 
 def get_project_version() -> Optional[str]:
-    """Read set(PROJECT_VER "x.y.z") from root CMakeLists.txt"""
+    """Read set(PROJECT_VER "x.y.z") from root CMakeLists.txt.
+
+    A generated product/brand.gen.cmake (scripts/build.py --brand) overrides the
+    checked-in version at configure time, so release naming follows it too.
+    """
+    version: Optional[str] = None
     with Path("CMakeLists.txt").open(encoding='utf-8') as f:
         for line in f:
             if line.startswith("set(PROJECT_VER"):
-                return line.split("\"")[1]
-    return None
+                version = line.split("\"")[1]
+                break
+    gen = Path("product/brand.gen.cmake")
+    if gen.is_file():
+        match = re.search(
+            r'^\s*set\(BRAND_PROJECT_VER\s+"([^"]+)"\)',
+            gen.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if match:
+            version = match.group(1)
+    return version
 
 def _get_idf_command() -> list[str]:
     """Get the command used to invoke the active ESP-IDF."""
@@ -1069,6 +1086,7 @@ def _select_variants_for_changes(
         if not path:
             continue
         if (path in global_paths or path.startswith("components/") or
+                path.startswith("product/") or
                 path.startswith("partitions/") or
                 path.startswith("sdkconfig.defaults") or
                 path.startswith("scripts/ci/") or
@@ -1330,6 +1348,355 @@ def _merge_sdkconfig_options(
 
 
 ################################################################################
+# OEM brand (tenant) profiles
+################################################################################
+
+_BRAND_PROFILES_DIR = Path("product/profiles")
+_BRAND_ASSETS_DIR = Path("product/brand_assets")
+_BRAND_GEN_CMAKE = Path("product/brand.gen.cmake")
+_BRAND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_BRAND_PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+_BRAND_PROJECT_VER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_BRAND_ACCENT_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_BRAND_SDKCONFIG_KEY_RE = re.compile(r"^CONFIG_[A-Za-z0-9_]+$")
+
+# Portal pages are embedded in the app partition (3-4 MB on most layouts).
+_BRAND_PORTAL_MAX_RAW_BYTES = 512 * 1024
+_BRAND_PORTAL_WARN_RAW_BYTES = 256 * 1024
+_BRAND_PORTAL_WARN_GZ_BYTES = 96 * 1024
+
+
+def _collect_brand_profiles() -> list[str]:
+    """Return the available tenant profile names (product/profiles/*.json)."""
+    if not _BRAND_PROFILES_DIR.is_dir():
+        return []
+    return sorted(path.stem for path in _BRAND_PROFILES_DIR.glob("*.json"))
+
+
+def _brand_product_path(relative: str, where: str) -> Path:
+    """Resolve a profile path against product/ and refuse escapes."""
+    base = Path("product").resolve()
+    resolved = (base / relative).resolve()
+    if not resolved.is_relative_to(base):
+        raise ValueError(f"{where}: path escapes product/: {relative!r}")
+    return resolved
+
+
+def _brand_optional_string(
+    mapping: dict[str, Any],
+    key: str,
+    where: str,
+) -> Optional[str]:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: {key!r} must be a string")
+    if "\r" in value or "\n" in value:
+        raise ValueError(f"{where}: {key!r} must not contain newlines")
+    return value
+
+
+def _load_brand_profile(name: str) -> dict[str, Any]:
+    """Load and validate product/profiles/<name>.json."""
+    if not _BRAND_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid brand profile name {name!r}: use letters, digits, '.', '_' or '-'"
+        )
+    path = _BRAND_PROFILES_DIR / f"{name}.json"
+    if not path.is_file():
+        available = ", ".join(_collect_brand_profiles()) or "<none>"
+        raise ValueError(f"Brand profile {name!r} not found ({path}); available: {available}")
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: invalid JSON: {error}") from error
+    if not isinstance(profile, dict):
+        raise ValueError(f"{path}: profile must be a JSON object")
+    _validate_brand_profile(profile, path)
+    return profile
+
+
+def _validate_brand_profile(profile: dict[str, Any], path: Path) -> None:
+    where = str(path)
+
+    brand_name = _brand_optional_string(profile, "brand_name", where)
+    if brand_name is not None and not brand_name.strip():
+        raise ValueError(f"{where}: 'brand_name' must not be blank")
+
+    project_name = _brand_optional_string(profile, "project_name", where)
+    if project_name is not None and not _BRAND_PROJECT_NAME_RE.match(project_name):
+        raise ValueError(
+            f"{where}: 'project_name' must match {_BRAND_PROJECT_NAME_RE.pattern}"
+        )
+    project_ver = _brand_optional_string(profile, "project_ver", where)
+    if project_ver is not None and not _BRAND_PROJECT_VER_RE.match(project_ver):
+        raise ValueError(f"{where}: 'project_ver' must be x.y.z")
+
+    sdkconfig = profile.get("sdkconfig", {})
+    if not isinstance(sdkconfig, dict):
+        raise ValueError(f"{where}: 'sdkconfig' must be an object")
+    for key, value in sdkconfig.items():
+        if not _BRAND_SDKCONFIG_KEY_RE.match(str(key)):
+            raise ValueError(f"{where}: invalid sdkconfig key {key!r} (must be CONFIG_*)")
+        if not isinstance(value, (str, bool, int)) or isinstance(value, float):
+            raise ValueError(
+                f"{where}: sdkconfig[{key!r}] must be a string, boolean or integer"
+            )
+
+    web = profile.get("web", {})
+    if not isinstance(web, dict):
+        raise ValueError(f"{where}: 'web' must be an object")
+    for key in ("title", "footer", "support_url", "logo", "portal_pack"):
+        _brand_optional_string(web, key, where)
+    accent = _brand_optional_string(web, "accent_color", where)
+    if accent is not None and not _BRAND_ACCENT_RE.match(accent):
+        raise ValueError(f"{where}: 'web.accent_color' must be #RRGGBB")
+    theme = _brand_optional_string(web, "theme", where)
+    if theme not in (None, "", "dark", "light"):
+        raise ValueError(f"{where}: 'web.theme' must be \"dark\", \"light\" or omitted")
+    if not isinstance(web.get("brand_config", {}), dict):
+        raise ValueError(f"{where}: 'web.brand_config' must be an object")
+
+    logo = web.get("logo")
+    if logo:
+        logo_path = _brand_product_path(logo, where)
+        if not logo_path.is_file():
+            raise ValueError(f"{where}: logo file not found: {logo_path}")
+        if logo_path.suffix.lower() not in (".svg", ".png"):
+            raise ValueError(f"{where}: logo must be .svg or .png: {logo_path}")
+
+    pack = web.get("portal_pack")
+    if pack:
+        pack_path = _brand_product_path(pack, where)
+        if not (pack_path / "index.html").is_file():
+            raise ValueError(f"{where}: portal pack must contain index.html: {pack_path}")
+
+
+def _clean_brand_staging() -> None:
+    """Remove staged brand assets so an unbranded build cannot inherit them."""
+    if _BRAND_ASSETS_DIR.exists():
+        shutil.rmtree(_BRAND_ASSETS_DIR)
+    if _BRAND_GEN_CMAKE.exists():
+        _BRAND_GEN_CMAKE.unlink()
+
+
+_BRAND_STAGING_RELATIVE_FILES = (
+    "logo",
+    "brand_config.json",
+    "portal/wifi_configuration.html",
+    "portal/wifi_configuration.html.gz",
+    "portal/wifi_configuration_done.html",
+    "portal/wifi_configuration_done.html.gz",
+)
+
+
+def _write_if_changed(path: Path, data: bytes) -> bool:
+    """Write bytes only when they differ and report whether a write happened.
+
+    CMake embeds these staged files through target_add_binary_data. Rewriting
+    identical bytes bumps the timestamp and forces an unnecessary re-embed and
+    relink on every build, so unchanged output is left untouched.
+    """
+    try:
+        if path.is_file() and path.read_bytes() == data:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return True
+
+
+def _prune_brand_staging(expected: set[str]) -> None:
+    """Remove artifacts left by a previous tenant that this profile omits."""
+    for relative in _BRAND_STAGING_RELATIVE_FILES:
+        path = _BRAND_ASSETS_DIR / relative
+        if relative not in expected and path.exists():
+            path.unlink()
+    portal = _BRAND_ASSETS_DIR / "portal"
+    if portal.is_dir() and not any(portal.iterdir()):
+        portal.rmdir()
+    if _BRAND_ASSETS_DIR.is_dir() and not any(_BRAND_ASSETS_DIR.iterdir()):
+        _BRAND_ASSETS_DIR.rmdir()
+
+
+def _write_portal_page(source: Path, destination: Path) -> bool:
+    """Stage one portal page plus its deterministic pre-gzip'd sibling."""
+    data = source.read_bytes()
+    if len(data) > _BRAND_PORTAL_MAX_RAW_BYTES:
+        raise ValueError(
+            f"Portal page {source} is {len(data)} bytes; the limit is "
+            f"{_BRAND_PORTAL_MAX_RAW_BYTES} bytes"
+        )
+    compressed = gzip.compress(data, compresslevel=9, mtime=0)
+    changed = _write_if_changed(destination, data)
+    changed |= _write_if_changed(
+        destination.with_name(destination.name + ".gz"), compressed
+    )
+    if (
+        len(data) > _BRAND_PORTAL_WARN_RAW_BYTES
+        or len(compressed) > _BRAND_PORTAL_WARN_GZ_BYTES
+    ):
+        print(
+            f"[WARN] Portal page {source.name} is large: "
+            f"{len(data)} bytes raw, {len(compressed)} bytes gzip"
+        )
+    return changed
+
+
+def _stage_brand_profile(name: str, profile: dict[str, Any]) -> dict[str, Optional[str]]:
+    """Stage logo/portal pack/brand config; return what was staged.
+
+    The staged paths are fixed because the firmware C++ code and CMake refer to
+    them by name: product/brand_assets/logo, product/brand_assets/brand_config.json
+    and product/brand_assets/portal/wifi_configuration{,_done}.html[.gz].
+
+    Staging is content-stable: unchanged artifacts keep their timestamps so the
+    CMake embed steps are skipped and the previous build cache is reused.
+    """
+    web = profile.get("web", {})
+    staged: dict[str, Optional[str]] = {"logo_format": None, "brand_config": None}
+    expected: set[str] = set()
+    changed: list[str] = []
+
+    pack = web.get("portal_pack")
+    if pack:
+        pack_dir = _brand_product_path(pack, f"brand {name}")
+        for source_name, target_name in (
+            ("index.html", "wifi_configuration.html"),
+            ("done.html", "wifi_configuration_done.html"),
+        ):
+            source = pack_dir / source_name
+            if not source.is_file():
+                # done.html is optional; index.html is validated on load.
+                continue
+            expected.add(f"portal/{target_name}")
+            expected.add(f"portal/{target_name}.gz")
+            if _write_portal_page(
+                source, _BRAND_ASSETS_DIR / "portal" / target_name
+            ):
+                changed.append(f"portal/{target_name}")
+
+    logo = web.get("logo")
+    if logo:
+        logo_path = _brand_product_path(logo, f"brand {name}")
+        expected.add("logo")
+        if _write_if_changed(_BRAND_ASSETS_DIR / "logo", logo_path.read_bytes()):
+            changed.append("logo")
+        staged["logo_format"] = "svg" if logo_path.suffix.lower() == ".svg" else "png"
+
+    brand_config = web.get("brand_config") or {}
+    if brand_config:
+        expected.add("brand_config.json")
+        payload = json.dumps(
+            brand_config, ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        if _write_if_changed(_BRAND_ASSETS_DIR / "brand_config.json", payload):
+            changed.append("brand_config.json")
+        staged["brand_config"] = str(_BRAND_ASSETS_DIR / "brand_config.json")
+
+    gen_lines = ["# Generated by scripts/build.py --brand; do not edit."]
+    project_name = profile.get("project_name")
+    project_ver = profile.get("project_ver")
+    if project_name:
+        gen_lines.append(f'set(BRAND_PROJECT_NAME "{project_name}")')
+    if project_ver:
+        gen_lines.append(f'set(BRAND_PROJECT_VER "{project_ver}")')
+    if len(gen_lines) > 1:
+        content = ("\n".join(gen_lines) + "\n").encode("utf-8")
+        if _write_if_changed(_BRAND_GEN_CMAKE, content):
+            changed.append(_BRAND_GEN_CMAKE.name)
+    elif _BRAND_GEN_CMAKE.exists():
+        # Drop a stale override so the checked-in defaults apply again.
+        _BRAND_GEN_CMAKE.unlink()
+        changed.append(_BRAND_GEN_CMAKE.name)
+
+    _prune_brand_staging(expected)
+
+    if changed:
+        print(f"[INFO] Brand staging updated: {', '.join(sorted(changed))}")
+    else:
+        print("[INFO] Brand staging unchanged; reusing previous build cache")
+    return staged
+
+
+def _sdkconfig_string_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _sdkconfig_literal(value: Any) -> str:
+    """Serialize a profile sdkconfig value in sdkconfig syntax."""
+    if isinstance(value, bool):
+        return "y" if value else "n"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if text in ("y", "n") or re.fullmatch(r"-?\d+", text) or text.startswith('"'):
+        return text
+    return _sdkconfig_string_value(text)
+
+
+def _brand_sdkconfig_options(
+    profile: dict[str, Any],
+    staged: dict[str, Optional[str]],
+) -> list[str]:
+    """Return the brand sdkconfig fragment (merged last, so it wins)."""
+    web = profile.get("web", {})
+    options: list[str] = []
+
+    def add_string(symbol: str, value: Optional[str]) -> None:
+        if value:
+            options.append(f"{symbol}={_sdkconfig_string_value(value)}")
+
+    add_string("CONFIG_PRODUCT_BRAND_NAME", profile.get("brand_name"))
+    add_string("CONFIG_PRODUCT_BRAND_PORTAL_TITLE", web.get("title"))
+    add_string("CONFIG_PRODUCT_BRAND_PORTAL_ACCENT", web.get("accent_color"))
+    add_string("CONFIG_PRODUCT_BRAND_PORTAL_THEME", web.get("theme"))
+    add_string("CONFIG_PRODUCT_BRAND_PORTAL_FOOTER", web.get("footer"))
+    add_string("CONFIG_PRODUCT_BRAND_PORTAL_SUPPORT_URL", web.get("support_url"))
+
+    logo_format = staged.get("logo_format")
+    if logo_format == "svg":
+        options.append("CONFIG_PRODUCT_BRAND_LOGO_SVG=y")
+    elif logo_format == "png":
+        options.append("CONFIG_PRODUCT_BRAND_LOGO_PNG=y")
+    if staged.get("brand_config"):
+        options.append("CONFIG_PRODUCT_BRAND_PORTAL_CONFIG=y")
+
+    for key, value in (profile.get("sdkconfig") or {}).items():
+        options.append(f"{key}={_sdkconfig_literal(value)}")
+    return options
+
+
+def _brand_portal_config(
+    profile: dict[str, Any],
+    staged: dict[str, Optional[str]],
+) -> dict[str, Any]:
+    """Return the runtime window.BRAND_CONFIG payload implied by a profile.
+
+    This mirrors main/boards/common/wifi_board.cc: the declarative brand_config
+    is the base and Kconfig-equivalent profile fields fill in missing keys.
+    """
+    web = profile.get("web", {})
+    config: dict[str, Any] = dict(web.get("brand_config") or {})
+
+    def set_default(key: str, value: Optional[str]) -> None:
+        if value and key not in config:
+            config[key] = value
+
+    set_default("name", profile.get("brand_name"))
+    set_default("accent", web.get("accent_color"))
+    set_default("theme", web.get("theme"))
+    set_default("footer", web.get("footer"))
+    set_default("support_url", web.get("support_url"))
+    if staged.get("logo_format") and "logo" not in config:
+        config["logo"] = "/brand-logo"
+    return config
+
+
+################################################################################
 # Check board_type in CMakeLists
 ################################################################################
 
@@ -1519,6 +1886,8 @@ def build_board(
     wake_word: Optional[str] = None,
     build_options: Optional[dict[str, object]] = None,
     idf_version: tuple[int, int, int] = (6, 0, 0),
+    brand_options: Optional[list[str]] = None,
+    brand_label: Optional[str] = None,
 ) -> None:
     """Compile one specified variant of the specified board type.
 
@@ -1530,6 +1899,8 @@ def build_board(
         language: optional locale such as zh-CN; defaults to en-US when omitted
         wake_word: optional model/alias; otherwise selected from language and board support
         build_options: optional semantic, board-validated option values
+        brand_options: brand sdkconfig fragment from --brand (merged last)
+        brand_label: tenant profile name, for build output
     """
     cfg_path = _BOARDS_DIR / Path(board_type) / config_filename
     if not cfg_path.exists():
@@ -1650,6 +2021,10 @@ def build_board(
             user_options,
         )
         sdkconfig_append = _apply_auto_selects(sdkconfig_append)
+        if brand_options:
+            # Brand values are applied last: a tenant profile outranks board
+            # defaults, language, wake word and build options.
+            sdkconfig_append = _merge_sdkconfig_options(sdkconfig_append, brand_options)
 
         print("-" * 80)
         print(f"name: {final_name}")
@@ -1661,6 +2036,8 @@ def build_board(
             print(f"manufacturer: {manufacturer}")
         print(f"language: {selected_language}")
         print(f"wake_word: {selected_wake_word}")
+        if brand_label:
+            print(f"brand: {brand_label}")
         if selected_build_options is not None:
             print(
                 "build_options: "
@@ -1802,6 +2179,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         action="store_true",
         help="Read changed paths from stdin and output the affected variants as JSON",
     )
+    parser.add_argument(
+        "--brand",
+        metavar="TENANT",
+        help=(
+            "OEM brand profile from product/profiles/<TENANT>.json. Stages the "
+            "tenant portal pack, logo and brand config, and applies its brand "
+            "sdkconfig options last (highest priority)"
+        ),
+    )
+    parser.add_argument(
+        "--list-brands",
+        action="store_true",
+        help="List OEM brand profiles available in product/profiles",
+    )
 
     cli_args = sys.argv[1:] if argv is None else argv
     if not cli_args:
@@ -1821,12 +2212,37 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.build_options_json
             or args.zip
             or args.json
+            or args.brand
+            or args.list_brands
         ):
             parser.error("--select-changed cannot be combined with build or list options")
         idf_version = _detect_idf_version_for_listing()
         variants = _collect_variants(config_filename=args.config, idf_version=idf_version)
         selected = _select_variants_for_changes(variants, sys.stdin.read().splitlines())
         print(json.dumps(selected))
+        return
+
+    if args.list_brands:
+        if (
+            args.board is not None
+            or args.list_boards
+            or args.list_languages
+            or args.list_wake_words
+            or args.name
+            or args.language
+            or args.wake_word
+            or args.build_options_json
+            or args.zip
+            or args.brand
+        ):
+            parser.error(
+                "--list-brands cannot be combined with build or other list options"
+            )
+        profiles = _collect_brand_profiles()
+        if args.json:
+            print(json.dumps(profiles))
+        else:
+            print("\n".join(profiles))
         return
 
     if args.list_languages:
@@ -1949,6 +2365,21 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
             sys.exit(1)
 
+    # Brand assets must follow this invocation: stage the profile when one is
+    # selected, and clear any previous staging otherwise so an unbranded build
+    # can never inherit a tenant's portal pack or logo.
+    brand_options: list[str] = []
+    if args.brand:
+        try:
+            brand_profile = _load_brand_profile(args.brand)
+            brand_staged = _stage_brand_profile(args.brand, brand_profile)
+            brand_options = _brand_sdkconfig_options(brand_profile, brand_staged)
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+        print(f"brand: {args.brand} ({len(brand_options)} sdkconfig options)")
+    else:
+        _clean_brand_staging()
+
     for variant in selected_variants:
         bt = variant["board"]
         if not _board_type_exists(bt):
@@ -1967,6 +2398,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             wake_word=args.wake_word,
             build_options=parsed_build_options,
             idf_version=idf_version,
+            brand_options=brand_options,
+            brand_label=args.brand,
         )
 
 

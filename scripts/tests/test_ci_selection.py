@@ -47,6 +47,8 @@ class CiSelectionTests(unittest.TestCase):
             "CMakeLists.txt", "sdkconfig.defaults.esp32p4", "dependencies.lock",
             ".github/workflows/build.yml", "scripts/ci/representative-variants.json",
             "scripts/build.py", "partitions/v2/16m.csv",
+            "product/profiles/example.json",
+            "components/esp-wifi-connect/assets/wifi_configuration.html",
         ):
             with self.subTest(path=path):
                 self.assertEqual(
@@ -175,7 +177,7 @@ class WorkflowDiffTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-m", "test change")
 
-    def selected_paths(self, event="push", before=None, ref="refs/heads/main"):
+    def workflow_outputs(self, event="push", before=None, ref="refs/heads/main"):
         output = self.root / "github-output"
         env = dict(os.environ)
         env.update({
@@ -188,7 +190,23 @@ class WorkflowDiffTests(unittest.TestCase):
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.script],
             cwd=self.root, env=env, capture_output=True, text=True, check=True,
         )
-        return json.loads(output.read_text().removeprefix("variants="))
+        outputs = {}
+        for line in output.read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                outputs[key] = value
+        return outputs
+
+    def selected_paths(self, **kwargs):
+        return json.loads(self.workflow_outputs(**kwargs)["variants"])
+
+    def test_brand_paths_request_a_brand_build(self):
+        self.commit_file("product/profiles/example.json")
+        self.assertEqual(self.workflow_outputs()["brand_changed"], "true")
+
+    def test_unrelated_paths_skip_the_brand_build(self):
+        self.commit_file("docs/readme-note.md")
+        self.assertEqual(self.workflow_outputs()["brand_changed"], "false")
 
     def test_normal_push_includes_only_changed_paths(self):
         self.commit_file("main/boards/example/config.h")

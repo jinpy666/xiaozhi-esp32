@@ -22,6 +22,7 @@ jobs:
       image: espressif/idf:release-v6.1
     outputs:
       variants: ${{ steps.select.outputs.variants }}
+      brand_changed: ${{ steps.select.outputs.brand_changed }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -68,6 +69,15 @@ jobs:
             cat "$RUNNER_TEMP/variants.json"
           } >> "$GITHUB_OUTPUT"
 
+          # Branding changes need a dedicated build even when no board changed:
+          # product profiles/assets and the OEM portal component are embedded
+          # into the firmware by the build pipeline.
+          if grep -qE '^(product/|components/esp-wifi-connect/|main/Kconfig$|main/CMakeLists\.txt$|main/boards/common/wifi_board\.cc$|CMakeLists\.txt$)' "$CHANGED_FILE"; then
+            echo "brand_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "brand_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build ${{ matrix.ci_name || matrix.full_name }}
     needs: prepare
@@ -83,12 +93,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.target }}-${{ matrix.ci_name || matrix.full_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-${{ matrix.ci_name || matrix.full_name }}-
+            ccache-${{ matrix.target }}-
+
       - name: Build current variant
         shell: bash
         env:
           BOARD: ${{ matrix.board }}
           VARIANT: ${{ matrix.name }}
           BUILD_OPTIONS_JSON: ${{ toJSON(matrix.ci_build_options) }}
+          IDF_CCACHE_ENABLE: "1"
         run: |
           source "$IDF_PATH/export.sh"
           OPTIONS=()
@@ -101,5 +121,56 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: xiaozhi_${{ matrix.ci_name || matrix.full_name }}_${{ github.sha }}
+          path: build/merged-binary.bin
+          if-no-files-found: error
+
+  brand:
+    name: Build OEM brand portal (example)
+    needs: prepare
+    if: ${{ needs.prepare.outputs.brand_changed == 'true' }}
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-brand-example-${{ github.sha }}
+          restore-keys: |
+            ccache-brand-example-
+
+      - name: Build branded firmware
+        shell: bash
+        env:
+          IDF_CCACHE_ENABLE: "1"
+        run: |
+          source "$IDF_PATH/export.sh"
+          python scripts/build.py bread-compact-wifi --name bread-compact-wifi --brand example
+
+      - name: Verify branding is embedded
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          image = Path("build/merged-binary.bin").read_bytes()
+          checks = {
+              "project name from brand.gen.cmake": b"example-voice",
+              "brand name from Kconfig": b"Example",
+              "embedded brand logo": b"<svg",
+          }
+          for label, needle in checks.items():
+              assert needle in image, f"{label} is missing from the firmware image"
+              print(f"ok: {label}")
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: xiaozhi_brand-example_${{ github.sha }}
           path: build/merged-binary.bin
           if-no-files-found: error

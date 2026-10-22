@@ -1159,6 +1159,31 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_options(${COMPONENT_LIB} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++23>)
 endif()
 
+# Optional OEM brand assets, staged by scripts/build.py --brand <tenant>.
+# The paths are fixed so the generated symbols (_binary_logo_start,
+# _binary_brand_config_json_start) stay stable across tenants.
+set(BRAND_ASSETS_DIR "${CMAKE_CURRENT_LIST_DIR}/../product/brand_assets")
+if(CONFIG_PRODUCT_BRAND_LOGO_SVG OR CONFIG_PRODUCT_BRAND_LOGO_PNG)
+    if(NOT EXISTS "${BRAND_ASSETS_DIR}/logo")
+        message(FATAL_ERROR
+            "PRODUCT_BRAND_LOGO_* is enabled but ${BRAND_ASSETS_DIR}/logo is missing; "
+            "stage it with: python3 scripts/build.py <board> --brand <tenant>")
+    endif()
+    if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+        target_add_binary_data(${COMPONENT_LIB} "${BRAND_ASSETS_DIR}/logo" BINARY)
+    endif()
+endif()
+if(CONFIG_PRODUCT_BRAND_PORTAL_CONFIG)
+    if(NOT EXISTS "${BRAND_ASSETS_DIR}/brand_config.json")
+        message(FATAL_ERROR
+            "PRODUCT_BRAND_PORTAL_CONFIG is enabled but ${BRAND_ASSETS_DIR}/brand_config.json is missing; "
+            "stage it with: python3 scripts/build.py <board> --brand <tenant>")
+    endif()
+    if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+        target_add_binary_data(${COMPONENT_LIB} "${BRAND_ASSETS_DIR}/brand_config.json")
+    endif()
+endif()
+
 # Use target_compile_definitions to define the reported board identity
 # If BOARD_NAME is empty, use BOARD_TYPE
 if(NOT BOARD_NAME)

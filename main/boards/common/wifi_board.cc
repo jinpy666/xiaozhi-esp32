@@ -8,6 +8,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <cJSON.h>
 #include <esp_network.h>
 #include <esp_log.h>
 #include <esp_mac.h>
@@ -22,6 +23,62 @@
 #endif
 
 static const char *TAG = "WifiBoard";
+
+#ifdef CONFIG_PRODUCT_BRAND_PORTAL_CONFIG
+extern const char brand_config_json_start[] asm("_binary_brand_config_json_start");
+extern const char brand_config_json_end[] asm("_binary_brand_config_json_end");
+#endif
+#if defined(CONFIG_PRODUCT_BRAND_LOGO_SVG) || defined(CONFIG_PRODUCT_BRAND_LOGO_PNG)
+extern const uint8_t brand_logo_start[] asm("_binary_logo_start");
+extern const uint8_t brand_logo_end[] asm("_binary_logo_end");
+#endif
+
+// Build the portal brand payload: the embedded tenant JSON (if any) is the
+// base, Kconfig values fill in whatever it does not override. Returns an empty
+// string when nothing is branded, which keeps the stock portal and avoids
+// registering /brand.js at all.
+static std::string BuildPortalBrandJson() {
+    cJSON* root = nullptr;
+#ifdef CONFIG_PRODUCT_BRAND_PORTAL_CONFIG
+    root = cJSON_ParseWithLength(brand_config_json_start,
+                                 brand_config_json_end - brand_config_json_start);
+#endif
+    if (root == nullptr || !cJSON_IsObject(root)) {
+        if (root != nullptr) {
+            cJSON_Delete(root);
+        }
+        root = cJSON_CreateObject();
+    }
+
+    auto add_default_string = [root](const char* key, const char* value) {
+        if (value != nullptr && value[0] != '\0' &&
+            cJSON_GetObjectItem(root, key) == nullptr) {
+            cJSON_AddStringToObject(root, key, value);
+        }
+    };
+
+    add_default_string("name", CONFIG_PRODUCT_BRAND_NAME);
+    add_default_string("accent", CONFIG_PRODUCT_BRAND_PORTAL_ACCENT);
+    add_default_string("theme", CONFIG_PRODUCT_BRAND_PORTAL_THEME);
+    add_default_string("footer", CONFIG_PRODUCT_BRAND_PORTAL_FOOTER);
+    add_default_string("support_url", CONFIG_PRODUCT_BRAND_PORTAL_SUPPORT_URL);
+#if defined(CONFIG_PRODUCT_BRAND_LOGO_SVG) || defined(CONFIG_PRODUCT_BRAND_LOGO_PNG)
+    if (cJSON_GetObjectItem(root, "logo") == nullptr) {
+        cJSON_AddStringToObject(root, "logo", "/brand-logo");
+    }
+#endif
+
+    std::string result;
+    if (cJSON_GetArraySize(root) > 0) {
+        char* str = cJSON_PrintUnformatted(root);
+        if (str != nullptr) {
+            result = str;
+            cJSON_free(str);
+        }
+    }
+    cJSON_Delete(root);
+    return result;
+}
 
 // Connection timeout in seconds
 static constexpr int CONNECT_TIMEOUT_SEC = 60;
@@ -58,6 +115,16 @@ void WifiBoard::StartNetwork() {
     config.language = Lang::CODE;
     config.show_ota_config = true;
     config.show_sleep_config = true;
+    config.portal_brand.config_json = BuildPortalBrandJson();
+#if defined(CONFIG_PRODUCT_BRAND_LOGO_SVG) || defined(CONFIG_PRODUCT_BRAND_LOGO_PNG)
+    config.portal_brand.logo_data = reinterpret_cast<const char*>(brand_logo_start);
+    config.portal_brand.logo_size = brand_logo_end - brand_logo_start;
+#ifdef CONFIG_PRODUCT_BRAND_LOGO_SVG
+    config.portal_brand.logo_mime = "image/svg+xml";
+#else
+    config.portal_brand.logo_mime = "image/png";
+#endif
+#endif
 
     // Set a DHCP hostname so the router shows a friendly name instead of "espressif".
     // Uses the same "<prefix>-<last 2 MAC bytes>" scheme as the config AP SSID.

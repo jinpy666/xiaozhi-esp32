@@ -1,0 +1,18 @@
+{
+    "brand_name": "Example",
+    "project_name": "example-voice",
+    "project_ver": "1.0.0",
+    "sdkconfig": {
+        "CONFIG_PRODUCT_BRAND_AP_PREFIX": "Example",
+        "CONFIG_PRODUCT_BRAND_BLE_NAME": "Example-Blufi",
+        "CONFIG_OTA_URL": "https://ota.example.com/device/ota/"
+    },
+    "web": {
+        "title": "Example 设备配网",
+        "accent_color": "#e11d48",
+        "theme": "",
+        "footer": "© Example",
+        "support_url": "https://example.com/help",
+        "logo": "profiles/example/logo.svg"
+    }
+}
