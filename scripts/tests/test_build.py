@@ -1726,6 +1726,8 @@ class CliTests(unittest.TestCase):
             wake_word=None,
             build_options=None,
             idf_version=(6, 0, 2),
+            brand_options=[],
+            brand_label=None,
         )
 
     def test_zip_flag_is_forwarded(self):

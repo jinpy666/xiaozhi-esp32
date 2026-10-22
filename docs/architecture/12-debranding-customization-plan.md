@@ -109,7 +109,11 @@ main/boards/common/wifi_board.cc:57   config.ssid_prefix = "Xiaozhi";   → 自�
 main/boards/common/blufi.cpp:15       #define BLUFI_DEVICE_NAME "Xiaozhi-Blufi" → 自有名
 ```
 
-配网 Web 页面在外部组件 `78/esp-wifi-connect` 内——页面标题等如需品牌化，fork 该组件或上游提交（见 [06 章](06-provisioning-and-activation.md)待验证项）。
+配网 Web 页面已通过 OEM fork 实现品牌化：`components/esp-wifi-connect/`（上游
+`78/esp-wifi-connect` v3.3.1 的本地组件，见 `components/README.md`）提供
+`/brand.js` 与 `/brand-logo` 端点、页面内嵌槽位与 gzip 下发。品牌参数经
+`product/profiles/<tenant>.json` + `scripts/build.py --brand` 注入；整页替换与
+接口契约见 [`docs/portal-contract.md`](../portal-contract.md)。
 
 ### 3.6 日志串清理（可选项）
 
@@ -136,6 +140,9 @@ python3 scripts/build.py --list-wake-words
 ## 5. 第二阶段：收敛到产品配置层
 
 上述改动落地后，把可变点收敛为 `product/profiles/<sku>.json`，由 build.py 合并注入（扩展点见 [02 章 §7](02-build-pipeline.md)），实现"一套代码、多品牌构建"：
+
+> 已落地：`python3 scripts/build.py <board> --brand <tenant>`。档案字段、暂存物、
+> 优先级与配网页三档定制见 [`product/README.md`](../../product/README.md) §8。
 
 | 品牌字段 | 注入方式 |
 | --- | --- |
@@ -199,7 +206,8 @@ python3 scripts/build.py --list-wake-words
 - 热点路径：`StartConfigAp()`（组件）→ 延迟 `Alert` 拼接 `CONNECT_TO_HOTSPOT + AP名 + ACCESS_VIA_BROWSER + 网址`（`wifi_board.cc:174-187`）——**语音 `wificonfig.ogg` 固定，屏幕文字动态含真实 AP 名与网址**。
 - BluFi 路径：`blufi.init()`，**无语音提示**。
 - 品牌名：AP 前缀 / BLE 名已 Kconfig 化（§3.5，`PRODUCT_BRAND_AP_PREFIX/BLE_NAME`）。
-- 配网页面（HTML/交互）在 `78/esp-wifi-connect` 组件内——本仓库改不了，需 fork 组件或上游贡献。
+- 配网页面（HTML/交互）：已由 `components/esp-wifi-connect/`（OEM fork）品牌化，
+  支持换肤、声明式内容定制和整页替换三档，契约见 [`../portal-contract.md`](../portal-contract.md)。
 - 配网态扬声器测试：`kDeviceStateAudioTesting` + `EnableAudioTesting()`（`application.cc:805-809,869-899`），测试包走 testing 队列（与解码队列 swap 复用）。
 
 自定义层级：
