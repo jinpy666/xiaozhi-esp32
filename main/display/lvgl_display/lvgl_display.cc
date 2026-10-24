@@ -13,6 +13,7 @@
 #include "jpg/image_to_jpeg.h"
 #include "lvgl_display.h"
 #include "lvgl_theme.h"
+#include "qrcode/qrcodegen.h"
 #include "settings.h"
 
 #define TAG "Display"
@@ -137,6 +138,14 @@ LvglDisplay::~LvglDisplay() {
     }
     if (low_battery_popup_ != nullptr) {
         lv_obj_del(low_battery_popup_);
+    }
+    if (qr_overlay_ != nullptr) {
+        // lv_canvas does not own its draw buffer; free it before deleting the object.
+        auto draw_buf = lv_canvas_get_draw_buf(qr_code_);
+        if (draw_buf != nullptr) {
+            lv_draw_buf_destroy(draw_buf);
+        }
+        lv_obj_del(qr_overlay_);
     }
     if (pm_lock_ != nullptr) {
         esp_pm_lock_delete(pm_lock_);
@@ -307,6 +316,114 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
 }
 
 void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {}
+
+bool LvglDisplay::ShowQrCode(const std::string& content) {
+    if (content.empty() || display_ == nullptr) {
+        return false;
+    }
+    DisplayLockGuard lock(this);
+    if (!lock) {
+        return false;
+    }
+
+    // Encode at ECC medium (qr_encodeBinary() uses the temp buffer as scratch,
+    // so it must hold the whole content; both buffers sized for the max version).
+    constexpr int kMaxQrVersion = 10;
+    uint8_t temp[qr_BUFFER_LEN_FOR_VERSION(kMaxQrVersion)];
+    uint8_t encoded[qr_BUFFER_LEN_FOR_VERSION(kMaxQrVersion)];
+    if (content.size() >= sizeof(temp)) {
+        ESP_LOGW(TAG, "ShowQrCode: content too long (%u bytes)", (unsigned)content.size());
+        return false;
+    }
+    std::memcpy(temp, content.data(), content.size());
+    if (!qr_encodeBinary(temp, content.size(), encoded, qr_Ecc_MEDIUM, qr_VERSION_MIN,
+                         kMaxQrVersion, qr_Mask_AUTO, true)) {
+        ESP_LOGW(TAG, "ShowQrCode: failed to encode %u bytes", (unsigned)content.size());
+        return false;
+    }
+    const int qr_size = qr_getSize(encoded);
+    const int quiet_zone = 2;  // white modules on each side of the QR
+
+    // Fit into the shorter screen side with a small pixel margin.
+    int side = width_ < height_ ? width_ : height_;
+    side -= (side > 128) ? 48 : 6;
+    if (side < 32) {
+        side = width_ < height_ ? width_ : height_;
+    }
+    const int scale = side / (qr_size + quiet_zone * 2);
+    if (scale < 1) {
+        ESP_LOGW(TAG, "ShowQrCode: %d-module QR does not fit in %d px", qr_size, side);
+        return false;
+    }
+    const int scaled = qr_size * scale;
+    const int margin = (side - scaled) / 2;
+
+    if (qr_overlay_ == nullptr) {
+        // Fullscreen card: a solid white background doubles as extra quiet zone
+        // and guarantees contrast regardless of the active theme.
+        qr_overlay_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_scrollbar_mode(qr_overlay_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_style_all(qr_overlay_);
+        lv_obj_set_size(qr_overlay_, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_color(qr_overlay_, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(qr_overlay_, LV_OPA_COVER, 0);
+        lv_obj_center(qr_overlay_);
+        qr_code_ = lv_canvas_create(qr_overlay_);
+        lv_obj_center(qr_code_);
+        lv_obj_add_flag(qr_overlay_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // (Re)allocate the monochrome canvas buffer when the size changed.
+    auto draw_buf = lv_canvas_get_draw_buf(qr_code_);
+    if (draw_buf != nullptr &&
+        (draw_buf->header.w != side || draw_buf->header.h != side)) {
+        auto new_buf = lv_draw_buf_create(side, side, LV_COLOR_FORMAT_I1, LV_STRIDE_AUTO);
+        if (new_buf == nullptr) {
+            ESP_LOGW(TAG, "ShowQrCode: failed to allocate %dx%d canvas", side, side);
+            return false;
+        }
+        lv_canvas_set_draw_buf(qr_code_, new_buf);
+        lv_draw_buf_destroy(draw_buf);
+        draw_buf = new_buf;
+    } else if (draw_buf == nullptr) {
+        draw_buf = lv_draw_buf_create(side, side, LV_COLOR_FORMAT_I1, LV_STRIDE_AUTO);
+        if (draw_buf == nullptr) {
+            ESP_LOGW(TAG, "ShowQrCode: failed to allocate %dx%d canvas", side, side);
+            return false;
+        }
+        lv_canvas_set_draw_buf(qr_code_, draw_buf);
+    }
+    lv_canvas_set_palette(qr_code_, 0, lv_color_to_32(lv_color_white(), LV_OPA_COVER));
+    lv_canvas_set_palette(qr_code_, 1, lv_color_to_32(lv_color_black(), LV_OPA_COVER));
+
+    // Rasterize module by module (activation screen only, once per code).
+    lv_draw_buf_clear(draw_buf, nullptr);  // 0 = palette[0] = white
+    const lv_color_t dark = lv_color_hex(1);  // palette index 1 = black
+    for (int y = 0; y < scaled; ++y) {
+        const int my = y / scale;
+        for (int x = 0; x < scaled; ++x) {
+            if (qr_getModule(encoded, x / scale, my)) {
+                lv_canvas_set_px(qr_code_, margin + x, margin + y, dark, LV_OPA_COVER);
+            }
+        }
+    }
+    lv_obj_invalidate(qr_code_);
+
+    lv_obj_remove_flag(qr_overlay_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(qr_overlay_);
+    return true;
+}
+
+void LvglDisplay::HideQrCode() {
+    if (qr_overlay_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    if (!lock) {
+        return;
+    }
+    lv_obj_add_flag(qr_overlay_, LV_OBJ_FLAG_HIDDEN);
+}
 
 void LvglDisplay::SetPowerSaveMode(bool on) {
     if (on) {

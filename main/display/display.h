@@ -81,6 +81,15 @@ public:
     }
     virtual void LoadAssets() {}
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
+    // Render `content` as a scannable QR code overlay. Returns false when the
+    // display cannot render QR codes (no display, unsupported renderer) or the
+    // content is empty; the caller keeps its previous UI in that case.
+    virtual bool ShowQrCode(const std::string& content) {
+        (void)content;
+        return false;
+    }
+    // Hide the QR code overlay shown by ShowQrCode(); no-op when none shown.
+    virtual void HideQrCode() {}
     virtual bool SetTextFont(std::shared_ptr<LvglFont> text_font) {
         (void)text_font;
         return false;
