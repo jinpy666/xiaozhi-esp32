@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -345,6 +346,9 @@ void Application::HandleActivationDoneEvent() {
     SystemInfo::PrintHeapStats();
     SetDeviceState(kDeviceStateIdle);
 
+    // The pairing QR is only meaningful while waiting for activation.
+    Board::GetInstance().GetDisplay()->HideQrCode();
+
     has_server_time_ = ota_->HasServerTime();
 
     // Protocol start may have already raised MAIN_EVENT_ERROR. Do not replace
@@ -522,6 +526,14 @@ void Application::CheckNewVersion() {
         if (ota_->HasActivationCode()) {
             ShowActivationCode(ota_->GetActivationCode(), ota_->GetActivationMessage());
         }
+        // Render the device UID as a QR code so the app can bind by scanning
+        // (content: "device_uid[,device_type]" per the consumer QR contract).
+        ShowPairingQr(display);
+
+        // Stop polling once the server-side activation window (timeout_ms)
+        // has elapsed; the outer loop re-fetches a fresh code and QR.
+        auto activation_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(ota_->GetActivationTimeoutMs());
 
         // This will block the loop until the activation is done or timeout
         for (int i = 0; i < 10; ++i) {
@@ -537,7 +549,15 @@ void Application::CheckNewVersion() {
             if (GetDeviceState() == kDeviceStateIdle) {
                 break;
             }
+            if (std::chrono::steady_clock::now() > activation_deadline) {
+                ESP_LOGW(TAG, "Activation window elapsed, refetching code");
+                display->SetChatMessage("system", Lang::Strings::ACTIVATION_EXPIRED);
+                break;
+            }
         }
+        // Leave the activation screen no matter why the polling ended; the outer
+        // loop re-renders a fresh code and QR if another round is needed.
+        display->HideQrCode();
     }
 }
 
@@ -759,6 +779,25 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
         if (it != digit_sounds.end()) {
             audio_service_.PlaySound(it->sound);
         }
+    }
+}
+
+void Application::ShowPairingQr(Display* display) {
+    if (display == nullptr) {
+        return;
+    }
+    // Consumer QR contract (parseConsumerQrScene): "device_uid[,device_type][,expire_at]".
+    // device_uid must match the Device-Id OTA header verbatim — it is the key the
+    // server addresses the device by. expire_at is omitted (0 = no expiry, the
+    // server has the final say). On small monochrome screens the type field is
+    // dropped to keep the QR version (and module size) minimal.
+    std::string content = SystemInfo::GetMacAddress();
+    if (!display->IsMonochrome()) {
+        content += ",";
+        content += BOARD_NAME;
+    }
+    if (!display->ShowQrCode(content)) {
+        ESP_LOGW(TAG, "Pairing QR not rendered (unsupported display)");
     }
 }
 
