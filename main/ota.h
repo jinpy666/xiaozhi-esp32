@@ -32,6 +32,7 @@ public:
     const std::string& GetFirmwareUrl() const { return firmware_url_; }
     const std::string& GetActivationMessage() const { return activation_message_; }
     const std::string& GetActivationCode() const { return activation_code_; }
+    int GetActivationTimeoutMs() const { return activation_timeout_ms_; }
     std::string GetCheckVersionUrl();
 
 private:

@@ -38,6 +38,7 @@
         "UPGRADING": "正在升級系統...",
         "UPGRADE_FAILED": "升級失敗",
         "ACTIVATION": "啟用設備",
+        "ACTIVATION_EXPIRED": "啟用碼已過期，正在重新取得",
         "BATTERY_LOW": "電量不足",
         "BATTERY_CHARGING": "正在充電",
         "BATTERY_FULL": "電量已滿",

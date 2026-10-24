@@ -32,6 +32,8 @@ public:
     virtual void ClearTextGlyphs() override;
     virtual bool SetTextFont(std::shared_ptr<LvglFont> text_font) override;
     virtual bool SupportsGuiOperations() const override { return true; }
+    virtual bool ShowQrCode(const std::string& content) override;
+    virtual void HideQrCode() override;
 
 protected:
     esp_pm_lock_handle_t pm_lock_ = nullptr;
@@ -44,6 +46,10 @@ protected:
     lv_obj_t* battery_label_ = nullptr;
     lv_obj_t* low_battery_popup_ = nullptr;
     lv_obj_t* low_battery_label_ = nullptr;
+
+    // QR code overlay (created lazily by ShowQrCode, hidden by HideQrCode)
+    lv_obj_t* qr_overlay_ = nullptr;
+    lv_obj_t* qr_code_ = nullptr;
 
     const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;

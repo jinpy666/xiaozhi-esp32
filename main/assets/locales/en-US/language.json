@@ -42,6 +42,7 @@
         "UPGRADING": "System is upgrading...",
         "UPGRADE_FAILED": "Upgrade failed",
         "ACTIVATION": "Activation",
+        "ACTIVATION_EXPIRED": "Activation code expired, fetching a new one",
         "BATTERY_LOW": "Low battery",
         "BATTERY_CHARGING": "Charging",
         "BATTERY_FULL": "Battery full",
