@@ -1203,4 +1203,54 @@ menu "TAIJIPAI_S3_CONFIG"
         启动双声道
 endmenu
 
+menu "Family Protocol"
+    help
+        Device-side implementation of FAMILY-PROTOCOL v1: voice messages to
+        family members, periodic location reports and SOS alarms.
+
+    config FAMILY_MESSAGE_MAX_DURATION_MS
+        int "Voice Message Maximum Duration (ms)"
+        default 60000
+        range 5000 60000
+        help
+            Maximum duration of a recorded family voice message. Recording
+            stops automatically and the message is sent when the limit is
+            reached. The protocol caps messages at 60 seconds.
+
+    config FAMILY_LOCATION_REPORT_INTERVAL_MS
+        int "Location Report Interval (ms)"
+        default 300000
+        range 10000 86400000
+        help
+            Interval of the periodic location report (default 5 minutes).
+            A report is only sent when a location source has been registered
+            via Application::SetFamilyLocationProvider(); boards without
+            positioning hardware never report.
+
+    config FAMILY_SOS_GPIO
+        int "SOS Button GPIO (-1 to disable)"
+        default -1
+        range -1 54
+        help
+            GPIO of a dedicated SOS button. Holding it pressed for
+            FAMILY_SOS_LONG_PRESS_MS sends the SOS uplink with
+            trigger:"button". Set to -1 when the board has no SOS button.
+
+    config FAMILY_SOS_ACTIVE_HIGH
+        bool "SOS Button is Active High"
+        default n
+        depends on FAMILY_SOS_GPIO >= 0
+        help
+            Logic level of the SOS button while pressed. The default assumes
+            the pin is pulled up and the button connects to ground.
+
+    config FAMILY_SOS_LONG_PRESS_MS
+        int "SOS Button Long Press Duration (ms)"
+        default 2000
+        range 500 10000
+        depends on FAMILY_SOS_GPIO >= 0
+        help
+            How long the SOS button must be held before the alarm fires.
+endmenu
+
 endmenu

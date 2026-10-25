@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <functional>
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "audio_service.h"
 #include "device_state.h"
 #include "device_state_machine.h"
+#include "button.h"
 #include "notify/notify_player.h"
 
 // Main event bits
@@ -43,6 +45,28 @@ enum AecMode {
     kAecOnDeviceSide,
     kAecOnServerSide,
 };
+
+// Family protocol (FAMILY-PROTOCOL v1): voice messages to family members,
+// periodic location reports and SOS alarms. See
+// wawabot-api/app/wawabot/docs/FAMILY-PROTOCOL.md §1.
+enum class FamilyLocationSource {
+    kGps,
+    kWifi,
+    kLbs,
+};
+
+struct FamilyLocationFix {
+    bool valid = false;  // false = no fix available, nothing is reported
+    double lat = 0.0;
+    double lng = 0.0;
+    FamilyLocationSource source = FamilyLocationSource::kLbs;
+    double accuracy_m = 0.0;
+    int battery_pct = -1;  // -1 = unknown, falls back to the board battery level
+};
+
+// Injectable location source. Boards without positioning hardware simply do
+// not register a provider, in which case no location report is ever sent.
+using FamilyLocationProvider = std::function<FamilyLocationFix()>;
 
 class Application {
 public:
@@ -126,6 +150,24 @@ public:
      */
     void ResetProtocol();
 
+    /**
+     * Family protocol (FAMILY-PROTOCOL v1), all thread-safe.
+     * StartFamilyMessageRecording / StopFamilyMessageRecording toggle the
+     * voice-message recording (encoded opus frames are buffered locally
+     * instead of being sent to the conversation pipeline, capped by
+     * CONFIG_FAMILY_MESSAGE_MAX_DURATION_MS with automatic stop + send).
+     * SendFamilySos fires the SOS uplink (trigger "button").
+     * SetFamilyLocationProvider injects the positioning source; without one
+     * the periodic timer produces no report.
+     */
+    void StartFamilyMessageRecording();
+    void StopFamilyMessageRecording();
+    bool IsFamilyRecordingMessage() const { return family_recording_; }
+    void SendFamilySos(const char* trigger);
+    void SetFamilyLocationProvider(FamilyLocationProvider provider) {
+        family_location_provider_ = std::move(provider);
+    }
+
 private:
     Application();
     ~Application();
@@ -147,6 +189,15 @@ private:
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
+
+    // Family protocol (FAMILY-PROTOCOL v1)
+    std::atomic<bool> family_recording_{false};
+    std::vector<uint8_t> family_record_buffer_;
+    int family_record_frames_ = 0;
+    std::string family_pending_played_message_id_;
+    std::unique_ptr<Button> family_sos_button_;
+    esp_timer_handle_t family_location_timer_ = nullptr;
+    FamilyLocationProvider family_location_provider_;
 
     bool has_server_time_ = false;
     bool startup_completed_ = false;
@@ -181,6 +232,19 @@ private:
 
     // Activation task (runs in background)
     void ActivationTask();
+
+    // Family protocol (FAMILY-PROTOCOL v1)
+    void InitializeFamilyFeatures();
+    void StartFamilyMessageRecordingInternal();
+    void StopFamilyMessageRecordingInternal(bool send);
+    void HandleFamilyJson(const cJSON* root);
+    void HandleFamilyMessageArrived(std::string message_id, std::string audio_url,
+                                    std::string sender_name);
+    void HandleFamilySosAcked(std::string sos_event_id, std::string acked_by_name);
+    void HandleFamilyAlarmFire(std::string alarm_id, std::string label, std::string time);
+    void HandleFamilyCallIncoming(std::string call_id);
+    void SendFamilyLocationReport();
+    static std::string GenerateFamilyMessageId();
 
     // Helper methods
     void CheckAssetsVersion();
