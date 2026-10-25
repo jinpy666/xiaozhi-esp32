@@ -2,6 +2,10 @@
 #include "assets.h"
 
 #include <esp_log.h>
+#include <cJSON.h>
+
+#include <cstdio>
+#include <cstring>
 
 #define TAG "Protocol"
 
@@ -103,6 +107,123 @@ void Protocol::SendMcpMessage(const std::string& payload) {
     std::string message =
         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
     SendText(message);
+}
+
+void Protocol::OnFamilyMessage(std::function<void(const cJSON* root)> callback) {
+    on_family_message_ = std::move(callback);
+}
+
+void Protocol::DispatchFamilyMessage(const cJSON* root) {
+    auto action = cJSON_GetObjectItem(root, "action");
+    if (!cJSON_IsString(action) || action->valuestring[0] == '\0') {
+        ESP_LOGW(TAG, "Family message missing action");
+        return;
+    }
+    // FAMILY-PROTOCOL v1 §1.2 downlink actions plus the §1.3 server ack.
+    if (strcmp(action->valuestring, "message_arrived") != 0 &&
+        strcmp(action->valuestring, "sos_acked") != 0 &&
+        strcmp(action->valuestring, "alarm_fire") != 0 &&
+        strcmp(action->valuestring, "call_incoming") != 0 &&
+        strcmp(action->valuestring, "ack") != 0) {
+        ESP_LOGW(TAG, "Unknown family action: %s", action->valuestring);
+        return;
+    }
+    if (on_family_message_ != nullptr) {
+        on_family_message_(root);
+    }
+}
+
+bool Protocol::SendFamilyAction(const char* action, cJSON* payload) {
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return false;
+    }
+    cJSON_AddStringToObject(root, "type", "family");
+    cJSON_AddStringToObject(root, "action", action);
+    if (payload != nullptr) {
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach (item, payload) {
+            cJSON_AddItemToObject(root, item->string, cJSON_Duplicate(item, 1));
+        }
+    }
+    auto json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json_str == nullptr) {
+        return false;
+    }
+    std::string message(json_str);
+    cJSON_free(json_str);
+    return SendText(message);
+}
+
+bool Protocol::SendFamilyVoiceMessage(const std::string& message_id, const std::string& audio_b64,
+                                      int duration_ms) {
+    // Built by hand instead of through cJSON: the base64 payload is large and
+    // message_id/audio_b64 never need JSON escaping (UUID and base64 alphabet).
+    std::string message = "{\"type\":\"family\",\"action\":\"message_send\",\"message_id\":\"" +
+                          message_id + "\",\"audio_format\":\"opus\",\"audio_b64\":\"" + audio_b64 +
+                          "\",\"duration_ms\":" + std::to_string(duration_ms) + "}";
+    return SendText(message);
+}
+
+bool Protocol::SendFamilyLocationReport(double lat, double lng, const char* source,
+                                        double accuracy_m, int battery_pct) {
+    cJSON* payload = cJSON_CreateObject();
+    if (payload == nullptr) {
+        return false;
+    }
+    cJSON_AddNumberToObject(payload, "lat", lat);
+    cJSON_AddNumberToObject(payload, "lng", lng);
+    cJSON_AddStringToObject(payload, "source", source);
+    cJSON_AddNumberToObject(payload, "accuracy_m", accuracy_m);
+    if (battery_pct >= 0) {
+        cJSON_AddNumberToObject(payload, "battery_pct", battery_pct);
+    }
+    bool sent = SendFamilyAction("location_report", payload);
+    cJSON_Delete(payload);
+    return sent;
+}
+
+bool Protocol::SendFamilySos(const std::string& message_id, const char* trigger) {
+    cJSON* payload = cJSON_CreateObject();
+    if (payload == nullptr) {
+        return false;
+    }
+    cJSON_AddStringToObject(payload, "message_id", message_id.c_str());
+    cJSON_AddStringToObject(payload, "trigger", trigger);
+    bool sent = SendFamilyAction("sos", payload);
+    cJSON_Delete(payload);
+    return sent;
+}
+
+bool Protocol::SendFamilyMessagePlayed(const std::string& message_id) {
+    cJSON* payload = cJSON_CreateObject();
+    if (payload == nullptr) {
+        return false;
+    }
+    cJSON_AddStringToObject(payload, "message_id", message_id.c_str());
+    bool sent = SendFamilyAction("message_played", payload);
+    cJSON_Delete(payload);
+    return sent;
+}
+
+bool Protocol::SendFamilyAck(const char* ref_action, const char* ref_id, bool ok,
+                             const char* error) {
+    cJSON* payload = cJSON_CreateObject();
+    if (payload == nullptr) {
+        return false;
+    }
+    cJSON_AddStringToObject(payload, "ref_action", ref_action);
+    if (ref_id != nullptr) {
+        cJSON_AddStringToObject(payload, "ref_id", ref_id);
+    }
+    cJSON_AddBoolToObject(payload, "ok", ok);
+    if (error != nullptr) {
+        cJSON_AddStringToObject(payload, "error", error);
+    }
+    bool sent = SendFamilyAction("ack", payload);
+    cJSON_Delete(payload);
+    return sent;
 }
 
 bool Protocol::IsTimeout() const {

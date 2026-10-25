@@ -14,6 +14,8 @@
 
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_random.h>
+#include <mbedtls/base64.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
@@ -177,6 +179,10 @@ void Application::Initialize() {
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
+
+    // Family protocol: optional SOS button (Kconfig GPIO) and the periodic
+    // location report timer (no-op until a location provider is injected)
+    InitializeFamilyFeatures();
 }
 
 void Application::Run() {
@@ -245,6 +251,21 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                if (family_recording_) {
+                    // Family voice message recording: accumulate the encoded
+                    // opus frames locally instead of the conversation uplink.
+                    family_record_buffer_.insert(family_record_buffer_.end(),
+                                                 packet->payload.begin(), packet->payload.end());
+                    family_record_frames_++;
+                    if (family_record_frames_ * OPUS_FRAME_DURATION_MS >=
+                        CONFIG_FAMILY_MESSAGE_MAX_DURATION_MS) {
+                        ESP_LOGW(TAG, "Family message reached the %d ms limit, stopping recording",
+                                 CONFIG_FAMILY_MESSAGE_MAX_DURATION_MS);
+                        StopFamilyMessageRecordingInternal(true);
+                        break;
+                    }
+                    continue;
+                }
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     // Drop the remaining packets. Leaving them in the queue would
                     // stall the Opus codec task (it waits for queue space), which in
@@ -579,6 +600,10 @@ void Application::InitializeProtocol() {
 
     protocol_->OnConnected([this]() { DismissAlert(); });
 
+    // Family protocol downlink (FAMILY-PROTOCOL v1 §1.2). Runs on the
+    // transport receive task; HandleFamilyJson parses and schedules.
+    protocol_->OnFamilyMessage([this](const cJSON* root) { HandleFamilyJson(root); });
+
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
@@ -750,6 +775,9 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        } else if (strcmp(type->valuestring, "family") == 0) {
+            // FAMILY-PROTOCOL v1: dispatch by "action" to the family handler
+            protocol_->DispatchFamilyMessage(root);
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
@@ -830,6 +858,12 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
+    // A press while recording a family message stops and sends it
+    if (family_recording_) {
+        StopFamilyMessageRecordingInternal(true);
+        return;
+    }
+
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -894,6 +928,12 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+    // A press while recording a family message stops and sends it
+    if (family_recording_) {
+        StopFamilyMessageRecordingInternal(true);
+        return;
+    }
+
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -948,6 +988,12 @@ void Application::HandleStopListeningEvent() {
 
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
+        return;
+    }
+
+    // Wake word detection is disabled while recording a family message;
+    // ignore a late event instead of interrupting the recording.
+    if (family_recording_) {
         return;
     }
 
@@ -1267,6 +1313,7 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
 void Application::StopNotification() {
     notify_player_.Stop();
     audio_service_.ResetDecoder();
+    family_pending_played_message_id_.clear();
     auto& board = Board::GetInstance();
     board.GetDisplay()->SetChatMessage("assistant", "");
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
@@ -1281,7 +1328,13 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     }
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
+    // Family message played receipt (FAMILY-PROTOCOL v1 §1.3): only reported
+    // after the audio_url playback completed successfully.
+    std::string played_message_id = family_pending_played_message_id_;
     StopNotification();
+    if (success && !played_message_id.empty() && protocol_) {
+        protocol_->SendFamilyMessagePlayed(played_message_id);
+    }
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
@@ -1491,4 +1544,335 @@ void Application::ResetProtocol() {
         // Reset protocol
         protocol_.reset();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Family protocol (FAMILY-PROTOCOL v1)
+// ---------------------------------------------------------------------------
+
+void Application::InitializeFamilyFeatures() {
+#if CONFIG_FAMILY_SOS_GPIO >= 0
+    family_sos_button_ = std::make_unique<Button>(
+        static_cast<gpio_num_t>(CONFIG_FAMILY_SOS_GPIO), CONFIG_FAMILY_SOS_ACTIVE_HIGH,
+        CONFIG_FAMILY_SOS_LONG_PRESS_MS);
+    family_sos_button_->OnLongPress([this]() { SendFamilySos("button"); });
+    ESP_LOGI(TAG, "Family SOS button on GPIO %d", CONFIG_FAMILY_SOS_GPIO);
+#endif
+
+    // Periodic location report. Without an injected provider (see
+    // SetFamilyLocationProvider) every tick is a no-op.
+    esp_timer_create_args_t timer_args = {
+        .callback =
+            [](void* arg) {
+                Application* app = static_cast<Application*>(arg);
+                app->Schedule([app]() { app->SendFamilyLocationReport(); });
+            },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "family_loc",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&timer_args, &family_location_timer_) == ESP_OK) {
+        esp_timer_start_periodic(family_location_timer_,
+                                 static_cast<uint64_t>(CONFIG_FAMILY_LOCATION_REPORT_INTERVAL_MS) *
+                                     1000ULL);
+    } else {
+        ESP_LOGE(TAG, "Failed to create family location timer");
+    }
+}
+
+void Application::StartFamilyMessageRecording() {
+    // Thread-safe: the actual start runs in the main task like other
+    // application mutations.
+    Schedule([this]() { StartFamilyMessageRecordingInternal(); });
+}
+
+void Application::StopFamilyMessageRecording() {
+    Schedule([this]() { StopFamilyMessageRecordingInternal(true); });
+}
+
+void Application::StartFamilyMessageRecordingInternal() {
+    if (family_recording_) {
+        ESP_LOGW(TAG, "Family message recording already in progress");
+        return;
+    }
+    // Mutually exclusive with wake word / conversation / notifications:
+    // recording is only allowed from idle, wake word detection is turned off
+    // and button events stop the recording instead of starting a chat.
+    if (GetDeviceState() != kDeviceStateIdle) {
+        ESP_LOGW(TAG, "Cannot record a family message in state %d",
+                 static_cast<int>(GetDeviceState()));
+        return;
+    }
+
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    family_record_buffer_.clear();
+    // Rough opus size estimate (~16 kbps at 16 kHz mono) to limit reallocations
+    family_record_buffer_.reserve((CONFIG_FAMILY_MESSAGE_MAX_DURATION_MS / 1000) * 2048);
+    family_record_frames_ = 0;
+    family_recording_ = true;
+    audio_service_.EnableWakeWordDetection(false);
+    // Reuse the regular input path: mic -> AFE -> opus encoder -> send queue.
+    // The main loop intercepts the send queue while family_recording_ is set.
+    audio_service_.EnableVoiceProcessing(true);
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetStatus("Recording");
+    display->SetChatMessage("system", "Recording voice message");
+}
+
+void Application::StopFamilyMessageRecordingInternal(bool send) {
+    if (!family_recording_) {
+        return;
+    }
+    family_recording_ = false;
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(true);
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+
+    // Collect the last frames still sitting in the send queue, then discard
+    // anything beyond the duration cap.
+    const int max_frames = CONFIG_FAMILY_MESSAGE_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS;
+    while (family_record_frames_ < max_frames) {
+        auto packet = audio_service_.PopPacketFromSendQueue();
+        if (packet == nullptr) {
+            break;
+        }
+        family_record_buffer_.insert(family_record_buffer_.end(), packet->payload.begin(),
+                                     packet->payload.end());
+        family_record_frames_++;
+    }
+    while (audio_service_.PopPacketFromSendQueue())
+        ;
+
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetStatus(Lang::Strings::STANDBY);
+    display->SetChatMessage("system", "");
+
+    const int duration_ms = family_record_frames_ * OPUS_FRAME_DURATION_MS;
+    family_record_frames_ = 0;
+    if (!send || family_record_buffer_.empty() || duration_ms <= 0) {
+        ESP_LOGW(TAG, "Family message recording discarded (empty)");
+        family_record_buffer_.clear();
+        return;
+    }
+    if (protocol_ == nullptr) {
+        ESP_LOGE(TAG, "Protocol not initialized, family message dropped");
+        family_record_buffer_.clear();
+        return;
+    }
+
+    // Base64 encode the accumulated opus stream (same helper pattern as
+    // mcp_server.h).
+    size_t dlen = 0;
+    size_t olen = 0;
+    mbedtls_base64_encode(nullptr, 0, &dlen, family_record_buffer_.data(),
+                          family_record_buffer_.size());
+    std::string audio_b64(dlen, '\0');
+    int rc = mbedtls_base64_encode(reinterpret_cast<unsigned char*>(audio_b64.data()),
+                                   audio_b64.size(), &olen, family_record_buffer_.data(),
+                                   family_record_buffer_.size());
+    family_record_buffer_.clear();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to base64 encode family message, rc=%d", rc);
+        return;
+    }
+    audio_b64.resize(olen);
+
+    auto message_id = GenerateFamilyMessageId();
+    if (protocol_->SendFamilyVoiceMessage(message_id, audio_b64, duration_ms)) {
+        ESP_LOGI(TAG, "Family message %s sent (%d ms)", message_id.c_str(), duration_ms);
+    } else {
+        // WebSocket transports only accept text frames while the audio channel
+        // is open; MQTT accepts them whenever the broker is connected.
+        ESP_LOGE(TAG, "Failed to send family message %s (channel closed?)", message_id.c_str());
+        audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+    }
+}
+
+void Application::SendFamilySos(const char* trigger) {
+    // May be called from the button callback task; schedule the actual send.
+    Schedule([this, trigger = std::string(trigger != nullptr ? trigger : "button")]() {
+        if (protocol_ == nullptr) {
+            ESP_LOGE(TAG, "Cannot send SOS: protocol not initialized");
+            return;
+        }
+        auto message_id = GenerateFamilyMessageId();
+        if (protocol_->SendFamilySos(message_id, trigger.c_str())) {
+            ESP_LOGI(TAG, "SOS sent (message_id=%s)", message_id.c_str());
+            audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        } else {
+            ESP_LOGE(TAG, "Failed to send SOS (channel closed?)");
+            audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+        }
+    });
+}
+
+void Application::SendFamilyLocationReport() {
+    if (protocol_ == nullptr) {
+        return;
+    }
+
+    FamilyLocationFix fix;
+    if (family_location_provider_) {
+        fix = family_location_provider_();
+    }
+    if (!fix.valid) {
+        // Board provides no location source (or no fix yet): skip this tick.
+        ESP_LOGD(TAG, "Family location report skipped: no fix available");
+        return;
+    }
+
+    static const char* kSourceNames[] = {"gps", "wifi", "lbs"};
+    const char* source = kSourceNames[static_cast<int>(fix.source)];
+    int battery_pct = fix.battery_pct;
+    if (battery_pct < 0) {
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        if (Board::GetInstance().GetBatteryLevel(level, charging, discharging)) {
+            battery_pct = level;
+        }
+    }
+    bool sent =
+        protocol_->SendFamilyLocationReport(fix.lat, fix.lng, source, fix.accuracy_m, battery_pct);
+    if (sent) {
+        ESP_LOGI(TAG, "Family location report sent (%.6f, %.6f via %s)", fix.lat, fix.lng, source);
+    } else {
+        ESP_LOGW(TAG, "Failed to send family location report (channel closed?)");
+    }
+}
+
+std::string Application::GenerateFamilyMessageId() {
+    // UUID v4, same shape as Board::GenerateUuid().
+    uint8_t uuid[16];
+    esp_fill_random(uuid, sizeof(uuid));
+    uuid[6] = (uuid[6] & 0x0F) | 0x40;
+    uuid[8] = (uuid[8] & 0x3F) | 0x80;
+    char uuid_str[37];
+    snprintf(uuid_str, sizeof(uuid_str),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", uuid[0],
+             uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8], uuid[9],
+             uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+    return uuid_str;
+}
+
+void Application::HandleFamilyJson(const cJSON* root) {
+    // Runs on the transport receive task: extract fields, then schedule the
+    // actual handling into the main task (the cJSON tree is deleted on return).
+    auto action = cJSON_GetObjectItem(root, "action");
+    if (!cJSON_IsString(action)) {
+        ESP_LOGW(TAG, "Family message without action");
+        return;
+    }
+
+    if (strcmp(action->valuestring, "message_arrived") == 0) {
+        auto message_id = cJSON_GetObjectItem(root, "message_id");
+        auto audio_url = cJSON_GetObjectItem(root, "audio_url");
+        auto sender_name = cJSON_GetObjectItem(root, "sender_name");
+        if (!cJSON_IsString(message_id) || !cJSON_IsString(audio_url) ||
+            audio_url->valuestring[0] == '\0') {
+            ESP_LOGW(TAG, "Invalid family message_arrived payload");
+            return;
+        }
+        Schedule([this, message_id = std::string(message_id->valuestring),
+                  audio_url = std::string(audio_url->valuestring),
+                  sender_name = cJSON_IsString(sender_name) ? std::string(sender_name->valuestring)
+                                                            : std::string()]() {
+            HandleFamilyMessageArrived(message_id, audio_url, sender_name);
+        });
+    } else if (strcmp(action->valuestring, "sos_acked") == 0) {
+        auto sos_event_id = cJSON_GetObjectItem(root, "sos_event_id");
+        auto acked_by_name = cJSON_GetObjectItem(root, "acked_by_name");
+        Schedule([this, sos_event_id = cJSON_IsString(sos_event_id)
+                                            ? std::string(sos_event_id->valuestring)
+                                            : std::string(),
+                  acked_by_name = cJSON_IsString(acked_by_name)
+                                      ? std::string(acked_by_name->valuestring)
+                                      : std::string()]() {
+            HandleFamilySosAcked(sos_event_id, acked_by_name);
+        });
+    } else if (strcmp(action->valuestring, "alarm_fire") == 0) {
+        auto alarm_id = cJSON_GetObjectItem(root, "alarm_id");
+        auto label = cJSON_GetObjectItem(root, "label");
+        auto time = cJSON_GetObjectItem(root, "time");
+        Schedule([this, alarm_id = cJSON_IsString(alarm_id) ? std::string(alarm_id->valuestring)
+                                                            : std::string(),
+                  label = cJSON_IsString(label) ? std::string(label->valuestring) : std::string(),
+                  time = cJSON_IsString(time) ? std::string(time->valuestring) : std::string()]() {
+            HandleFamilyAlarmFire(alarm_id, label, time);
+        });
+    } else if (strcmp(action->valuestring, "call_incoming") == 0) {
+        auto call_id = cJSON_GetObjectItem(root, "call_id");
+        Schedule([this, call_id = cJSON_IsString(call_id) ? std::string(call_id->valuestring)
+                                                          : std::string()]() {
+            HandleFamilyCallIncoming(call_id);
+        });
+    } else if (strcmp(action->valuestring, "ack") == 0) {
+        // Server acknowledgement for one of our uplinks (§1.3): log only.
+        auto ref_action = cJSON_GetObjectItem(root, "ref_action");
+        auto ok = cJSON_GetObjectItem(root, "ok");
+        auto error = cJSON_GetObjectItem(root, "error");
+        ESP_LOGI(TAG, "Family ack: action=%s ok=%s error=%s",
+                 cJSON_IsString(ref_action) ? ref_action->valuestring : "?",
+                 cJSON_IsTrue(ok) ? "true" : "false",
+                 cJSON_IsString(error) ? error->valuestring : "-");
+        if (cJSON_IsObject(ok) && !cJSON_IsTrue(ok)) {
+            Schedule([this]() { audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION); });
+        }
+    }
+}
+
+void Application::HandleFamilyMessageArrived(std::string message_id, std::string audio_url,
+                                             std::string sender_name) {
+    if (family_recording_) {
+        ESP_LOGW(TAG, "Family message %s ignored while recording a message",
+                 message_id.c_str());
+        return;
+    }
+    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
+        // Not played, so no message_played receipt; the server side is
+        // responsible for redelivery.
+        ESP_LOGW(TAG, "Family message %s ignored while device is busy", message_id.c_str());
+        return;
+    }
+
+    ESP_LOGI(TAG, "Family message arrived from %s (%s)", sender_name.c_str(), message_id.c_str());
+    if (!sender_name.empty()) {
+        Board::GetInstance().GetDisplay()->SetChatMessage("system", sender_name.c_str());
+    }
+    family_pending_played_message_id_ = std::move(message_id);
+    // Reuse the notify player: it already streams audio from a URL through
+    // the audio service decode/playback pipeline.
+    StartNotification(std::move(audio_url), {});
+}
+
+void Application::HandleFamilySosAcked(std::string sos_event_id, std::string acked_by_name) {
+    ESP_LOGI(TAG, "Family SOS %s acknowledged by %s", sos_event_id.c_str(),
+             acked_by_name.c_str());
+    std::string message = "SOS";
+    if (!acked_by_name.empty()) {
+        message += " - " + acked_by_name;
+    }
+    Alert("SOS", message.c_str(), "neutral", Lang::Sounds::OGG_SUCCESS);
+}
+
+void Application::HandleFamilyAlarmFire(std::string alarm_id, std::string label,
+                                        std::string time) {
+    ESP_LOGI(TAG, "Family alarm fired: %s", alarm_id.c_str());
+    std::string message = label.empty() ? std::string("Alarm") : label;
+    if (!time.empty()) {
+        message += " " + time;
+    }
+    // Alert() shows status/emotion/chat message and plays the bundled sound;
+    // contract sound "chime" is mapped to the built-in exclamation sound.
+    Alert("Alarm", message.c_str(), "neutral", Lang::Sounds::OGG_EXCLAMATION);
+}
+
+void Application::HandleFamilyCallIncoming(std::string call_id) {
+    // v1 reserves call signaling only: report back that it is not implemented.
+    ESP_LOGW(TAG, "Family call signaling is not implemented in v1 (call_id=%s)",
+             call_id.c_str());
+    if (protocol_ != nullptr) {
+        protocol_->SendFamilyAck("call_incoming", call_id.c_str(), false, "not_implemented");
+    }
 }

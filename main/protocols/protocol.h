@@ -50,6 +50,7 @@ public:
 
     void OnIncomingAudio(std::function<void(std::unique_ptr<AudioStreamPacket> packet)> callback);
     void OnIncomingJson(std::function<void(const cJSON* root)> callback);
+    void OnFamilyMessage(std::function<void(const cJSON* root)> callback);
     void OnAudioChannelOpened(std::function<void()> callback);
     void OnAudioChannelClosed(std::function<void()> callback);
     void OnNetworkError(std::function<void(const std::string& message)> callback);
@@ -67,8 +68,25 @@ public:
     virtual void SendAbortSpeaking(AbortReason reason);
     virtual void SendMcpMessage(const std::string& message);
 
+    // Family protocol (FAMILY-PROTOCOL v1): JSON envelope {"type":"family",
+    // "action":"..."} alongside hello/listen/tts/mcp.
+    // Downlink: DispatchFamilyMessage() validates the action and forwards the
+    // whole message to the handler registered with OnFamilyMessage().
+    // Uplink: the SendFamily* helpers build the envelope and go through
+    // SendText(), which every transport implements (WebSocket text frame /
+    // MQTT JSON publish), so no transport-specific code is required here.
+    void DispatchFamilyMessage(const cJSON* root);
+    bool SendFamilyVoiceMessage(const std::string& message_id, const std::string& audio_b64,
+                                int duration_ms);
+    bool SendFamilyLocationReport(double lat, double lng, const char* source, double accuracy_m,
+                                  int battery_pct);
+    bool SendFamilySos(const std::string& message_id, const char* trigger);
+    bool SendFamilyMessagePlayed(const std::string& message_id);
+    bool SendFamilyAck(const char* ref_action, const char* ref_id, bool ok, const char* error);
+
 protected:
     std::function<void(const cJSON* root)> on_incoming_json_;
+    std::function<void(const cJSON* root)> on_family_message_;
     std::function<void(std::unique_ptr<AudioStreamPacket> packet)> on_incoming_audio_;
     std::function<void()> on_audio_channel_opened_;
     std::function<void()> on_audio_channel_closed_;
@@ -83,6 +101,7 @@ protected:
     std::chrono::time_point<std::chrono::steady_clock> last_incoming_time_;
 
     virtual bool SendText(const std::string& text) = 0;
+    bool SendFamilyAction(const char* action, cJSON* payload);
     virtual void SetError(const std::string& message);
     void SetError(const std::string& message, const std::string& detail);
     virtual bool IsTimeout() const;
