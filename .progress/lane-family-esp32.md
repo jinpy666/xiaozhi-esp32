@@ -27,9 +27,11 @@
 
 ## 门禁
 
-- **本机无 ESP-IDF（idf.py 不可用），未做编译验证**——静态走查：头/源
-  签名一致、回调注册面完整、Kconfig 语法对齐既有菜单。**main 合并挂起，
-  待有 IDF 环境跑 `idf.py build` 后由编排者合入**。
+- 2026-10-25 补：CI 钉版镜像 `espressif/idf:release-v6.1` Docker 化实机构建
+  （named volume `wawabot-esp32-work` 缓存工具链，与 build.yml 同口径）：
+  `scripts/build.py bread-compact-esp32` → BOARD1_BUILD_OK（esp32 + OLED）、
+  `scripts/build.py kevin/c3` → BOARD2_BUILD_OK（esp32c3 无屏）——**双板全绿，
+  main 合并解除挂起并已合入**。
 - 对端泳道状态：server 侧已合入远端 main（lane-family-srv）；api 侧
   MD-32/33 已在远端 master；mobile 侧 feat/lane-family-mobile 已推分支。
 
