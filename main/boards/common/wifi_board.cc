@@ -402,6 +402,13 @@ std::string WifiBoard::GetDeviceStatusJson() {
     cJSON_AddStringToObject(network, "type", "wifi");
     cJSON_AddStringToObject(network, "ssid", wifi.GetSsid().c_str());
     int rssi = wifi.GetRssi();
+    if (rssi != 0) {
+        // Raw RSSI in dBm. WifiManager::GetRssi() returns the 0 sentinel when
+        // the station is disconnected or esp_wifi_sta_get_ap_info fails, and
+        // 0 dBm is not a physically possible Wi-Fi reading, so the key is
+        // omitted in that case and readers treat it as unknown.
+        cJSON_AddNumberToObject(network, "rssi", rssi);
+    }
     const char* signal = rssi >= -60 ? "strong" : (rssi >= -70 ? "medium" : "weak");
     cJSON_AddStringToObject(network, "signal", signal);
     cJSON_AddItemToObject(root, "network", network);

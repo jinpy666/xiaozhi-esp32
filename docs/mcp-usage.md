@@ -109,6 +109,9 @@ A tool registered this way will not appear in a regular `tools/list` response. T
 
 Board-specific tools are appended after these by each board's `InitializeTools()`.
 
+The output shape of `self.get_device_status` (key names, units, and which keys are
+omitted when a capability is absent) is documented in [device-status.md](device-status.md).
+
 ### User-only tools - from `AddUserOnlyTools`
 
 These tools are hidden by default. The backend must pass `withUserTools=true` to `tools/list` to see them. They are intended for companion apps / end users rather than the AI model.
