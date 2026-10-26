@@ -778,6 +778,27 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "family") == 0) {
             // FAMILY-PROTOCOL v1: dispatch by "action" to the family handler
             protocol_->DispatchFamilyMessage(root);
+        } else if (strcmp(type->valuestring, "caption") == 0) {
+            // 同传字幕（wawabot 服务端扩展；仅 hello 声明 features.caption 的
+            // 设备会收到）。有译文显示译文、原文换行附后；翻译失败只有原文。
+            // final=false 为中间态，同一句段覆盖式刷新——固件不留字幕历史
+            // （ESP 内存约束，滚动由服务端 seq 定稿流保证最终一致）。
+            auto src = cJSON_GetObjectItem(root, "source");
+            auto dst = cJSON_GetObjectItem(root, "target");
+            const char* source = cJSON_IsString(src) ? src->valuestring : "";
+            const char* target = cJSON_IsString(dst) ? dst->valuestring : "";
+            if (source[0] == '\0' && target[0] == '\0') {
+                ESP_LOGW(TAG, "Caption message without text");
+            } else if (display != nullptr) {
+                std::string text = target[0] != '\0' ? target : source;
+                if (target[0] != '\0' && source[0] != '\0') {
+                    text += "\n";
+                    text += source;
+                }
+                Schedule([this, display, text]() {
+                    display->SetChatMessage("system", text.c_str());
+                });
+            }
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
