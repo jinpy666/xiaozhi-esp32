@@ -217,6 +217,11 @@ std::string WebsocketProtocol::GetHelloMessage() {
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
+    // 同传字幕（wawabot 服务端扩展）：声明后服务端才下发 caption 消息
+    // （features 门控）。字幕靠屏显，无显示屏板型不声明——声明了也无处呈现。
+    if (Board::GetInstance().GetDisplay() != nullptr) {
+        cJSON_AddBoolToObject(features, "caption", true);
+    }
     cJSON_AddItemToObject(root, "features", features);
     AddTextFontCapabilities(root);
     cJSON_AddStringToObject(root, "transport", "websocket");

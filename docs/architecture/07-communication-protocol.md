@@ -108,6 +108,7 @@ sequenceDiagram
 | alert | status/message/emotion(全必填) | Alert + OGG_VIBRATION |
 | system | command: "reboot" | 重启 |
 | custom | payload | 需 `CONFIG_RECEIVE_CUSTOM_MESSAGE` |
+| caption | session_id/seq/source/target/final | 同传字幕（wawabot 扩展）：有译文显示译文、原文换行附后；`target` 空 = 翻译失败只显原文；仅 hello 声明 `features.caption=true`（有显示屏板型）的设备会收到 |
 | goodbye | session_id | MQTT: 匹配则关通道，不回包（防 ping-pong） |
 
 ## 6. 超时 / 重连规则表

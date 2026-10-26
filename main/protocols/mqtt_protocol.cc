@@ -395,6 +395,10 @@ std::string MqttProtocol::GetHelloMessage() {
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
+    // 同传字幕（wawabot 服务端扩展）：与 websocket 面同口径，有显示屏才声明。
+    if (Board::GetInstance().GetDisplay() != nullptr) {
+        cJSON_AddBoolToObject(features, "caption", true);
+    }
     cJSON_AddItemToObject(root, "features", features);
     AddTextFontCapabilities(root);
     cJSON* audio_params = cJSON_CreateObject();
