@@ -635,11 +635,22 @@ void Application::InitializeProtocol() {
                      "resampling may cause distortion",
                      protocol_->server_sample_rate(), codec->output_sample_rate());
         }
+        // Family device call (spec §5): an announcement that arrived while the
+        // channel was still opening goes out now. Runs in the main task.
+        if (!family_call_pending_announcement_.empty()) {
+            protocol_->SendWakeWordDetected(family_call_pending_announcement_);
+            family_call_pending_announcement_.clear();
+        }
     });
 
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+            // Any channel close ends the family call window: the peer's hang
+            // up arrives as goodbye, network loss closes here. The SOS
+            // fallback and hang-up gesture clear the state themselves before
+            // closing, so this is the passive path only.
+            ClearFamilyCallState();
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -731,8 +742,20 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([this, display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
+                    // Family call (spec §5): the [device_call] announcement
+                    // also comes back as an stt display message; only a
+                    // different utterance means the user answered or rejected
+                    // by voice, which closes the ring wait (the server's
+                    // call_device flow takes it from there).
+                    if (family_call_state_ == FamilyCallState::kIncoming &&
+                        message != family_call_announcement_) {
+                        ESP_LOGI(TAG, "Family call %s: user replied, ring wait closed",
+                                 family_call_id_.c_str());
+                        StopFamilyCallRingTimer();
+                        family_call_state_ = FamilyCallState::kActive;
+                    }
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -894,6 +917,19 @@ void Application::HandleToggleChatEvent() {
     // A press while recording a family message stops and sends it
     if (family_recording_) {
         StopFamilyMessageRecordingInternal(true);
+        return;
+    }
+
+    // Family call hang-up gesture (device-call spec §5 / adjudication B1):
+    // a short press of the chat button while a family call phase is active
+    // rejects the ring wait or hangs up the call. The SOS long press lives on
+    // the dedicated SOS button (CONFIG_FAMILY_SOS_GPIO) and is untouched by
+    // this branch.
+    if (family_call_state_ != FamilyCallState::kIdle) {
+        bool was_incoming = family_call_state_ == FamilyCallState::kIncoming;
+        ESP_LOGI(TAG, "Family call %s ended by hang-up gesture",
+                 family_call_id_.c_str());
+        EndFamilyCall(was_incoming ? "rejected" : nullptr);
         return;
     }
 
@@ -1729,6 +1765,15 @@ void Application::SendFamilySos(const char* trigger) {
             ESP_LOGE(TAG, "Cannot send SOS: protocol not initialized");
             return;
         }
+        // Adjudication B1 (device-call spec §5): SOS delivery wins over call
+        // continuation. In gateway call mode the caller side loses its bridge
+        // (app.js:1148) and the gateway drops control uplinks without one
+        // (app.js:529-536), so the SOS is sent only after the call is torn
+        // down. Applied uniformly on both ends (callee / caller) so the
+        // fallback does not depend on which side of the bridge we are on.
+        if (family_call_state_ != FamilyCallState::kIdle) {
+            TearDownFamilyCallForSos();
+        }
         auto message_id = GenerateFamilyMessageId();
         if (protocol_->SendFamilySos(message_id, trigger.c_str())) {
             ESP_LOGI(TAG, "SOS sent (message_id=%s)", message_id.c_str());
@@ -1836,9 +1881,14 @@ void Application::HandleFamilyJson(const cJSON* root) {
         });
     } else if (strcmp(action->valuestring, "call_incoming") == 0) {
         auto call_id = cJSON_GetObjectItem(root, "call_id");
-        Schedule([this, call_id = cJSON_IsString(call_id) ? std::string(call_id->valuestring)
-                                                          : std::string()]() {
-            HandleFamilyCallIncoming(call_id);
+        auto caller_name = cJSON_GetObjectItem(root, "caller_name");
+        Schedule([this,
+                  call_id = cJSON_IsString(call_id) ? std::string(call_id->valuestring)
+                                                    : std::string(),
+                  caller_name = cJSON_IsString(caller_name)
+                                    ? std::string(caller_name->valuestring)
+                                    : std::string()]() {
+            HandleFamilyCallIncoming(call_id, caller_name);
         });
     } else if (strcmp(action->valuestring, "ack") == 0) {
         // Server acknowledgement for one of our uplinks (§1.3): log only.
@@ -1901,11 +1951,266 @@ void Application::HandleFamilyAlarmFire(std::string alarm_id, std::string label,
     Alert("Alarm", message.c_str(), "neutral", Lang::Sounds::OGG_EXCLAMATION);
 }
 
-void Application::HandleFamilyCallIncoming(std::string call_id) {
-    // v1 reserves call signaling only: report back that it is not implemented.
-    ESP_LOGW(TAG, "Family call signaling is not implemented in v1 (call_id=%s)",
-             call_id.c_str());
-    if (protocol_ != nullptr) {
-        protocol_->SendFamilyAck("call_incoming", call_id.c_str(), false, "not_implemented");
+void Application::HandleFamilyCallIncoming(std::string call_id, std::string caller_name) {
+    // FAMILY-PROTOCOL v1 §1.2 downlink (device-call spec §5). Runs in the
+    // main task (scheduled from HandleFamilyJson). The v1 device presents the
+    // call and waits for the user's spoken reply; answering/rejecting is a
+    // conversation intent handled by the server (call_device with answer=true
+    // via the [device_call] incoming-call flag). The firmware only manages
+    // the incoming-call phase and the ack.
+    if (protocol_ == nullptr) {
+        ESP_LOGE(TAG, "call_incoming dropped: protocol not initialized");
+        return;
     }
+    if (call_id.empty()) {
+        ESP_LOGW(TAG, "call_incoming without call_id");
+        protocol_->SendFamilyAck("call_incoming", "", false, "invalid");
+        return;
+    }
+    auto state = GetDeviceState();
+    if (family_recording_ || family_call_state_ != FamilyCallState::kIdle ||
+        state == kDeviceStateStarting || state == kDeviceStateActivating ||
+        state == kDeviceStateUpgrading || state == kDeviceStateWifiConfiguring ||
+        state == kDeviceStateAudioTesting || state == kDeviceStateFatalError) {
+        ESP_LOGW(TAG, "Family call %s rejected: device busy (state=%d, call_phase=%d)",
+                 call_id.c_str(), static_cast<int>(state),
+                 static_cast<int>(family_call_state_));
+        protocol_->SendFamilyAck("call_incoming", call_id.c_str(), false, "busy");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Family call incoming (call_id=%s, caller=%s)", call_id.c_str(),
+             caller_name.empty() ? "<unknown>" : caller_name.c_str());
+    family_call_state_ = FamilyCallState::kIncoming;
+    family_call_id_ = call_id;
+
+    // Announcement text for the server's [device_call] detect-text path: the
+    // server speaks it verbatim (direct TTS, no LLM) and arms the call_device
+    // answer flag for the user's spoken reply. Fallback wording when the
+    // signaling carries no caller name.
+    family_call_announcement_ = caller_name.empty()
+                                    ? "您收到一个新的来电，是否接听？"
+                                    : "您收到来自" + caller_name + "的来电，是否接听？";
+
+    if (!caller_name.empty()) {
+        Board::GetInstance().GetDisplay()->SetChatMessage("system", caller_name.c_str());
+    }
+
+    // The ring wait is now open; the timeout or the user's reply closes it.
+    protocol_->SendFamilyAck("call_incoming", call_id.c_str(), true, nullptr);
+    StartFamilyCallRingTimer();
+    InjectFamilyCallAnnouncement(family_call_announcement_);
+}
+
+void Application::InjectFamilyCallAnnouncement(std::string text) {
+    // Runs in the main task. Sends the announcement as listen-detect text so
+    // the server session (the [device_call] handler) announces the call; the
+    // audio channel is normally already up because the gateway wakes the
+    // callee (self.remote_wakeup) before the api pushes call_incoming.
+    auto state = GetDeviceState();
+    if (state == kDeviceStateNotifying) {
+        StopNotification();
+        state = kDeviceStateIdle;
+    }
+    if (state == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonNone);
+    }
+    if (protocol_->IsAudioChannelOpened()) {
+        protocol_->SendWakeWordDetected(text);
+        return;
+    }
+    // Channel not up yet: hold the announcement and get a channel. The open
+    // path sends it via the OnAudioChannelOpened hook.
+    family_call_pending_announcement_ = std::move(text);
+    state = GetDeviceState();
+    if (state == kDeviceStateIdle) {
+        SetDeviceState(kDeviceStateConnecting);
+        Schedule([this]() { ContinueFamilyCallAnnouncement(); });
+    } else if (state == kDeviceStateConnecting) {
+        // An open already in flight (remote_wakeup) fires the hook.
+    } else {
+        // Listening/Speaking with a closed channel: reopen in place; the
+        // announcement goes out from the OnAudioChannelOpened hook.
+        Schedule([this]() {
+            if (protocol_ != nullptr && !protocol_->IsAudioChannelOpened()) {
+                protocol_->OpenAudioChannel();
+            }
+        });
+    }
+}
+
+void Application::ContinueFamilyCallAnnouncement() {
+    // Runs in the main task; entered from Idle via Connecting.
+    if (family_call_pending_announcement_.empty()) {
+        return;
+    }
+    if (GetDeviceState() != kDeviceStateConnecting) {
+        return;
+    }
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (!protocol_->IsAudioChannelOpened()) {
+        if (!protocol_->OpenAudioChannel()) {
+            // Return to idle; the ring timeout acks the failure.
+            SetDeviceState(kDeviceStateIdle);
+            return;
+        }
+    }
+    // The channel is up and OnAudioChannelOpened already sent the pending
+    // announcement; move to listening so the user can answer by voice.
+    SetListeningMode(GetDefaultListeningMode());
+}
+
+void Application::StartFamilyCallRingTimer() {
+    StopFamilyCallRingTimer();
+    esp_timer_create_args_t timer_args = {
+        .callback =
+            [](void* arg) {
+                Application* app = static_cast<Application*>(arg);
+                app->Schedule([app]() { app->HandleFamilyCallRingTimeout(); });
+            },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "family_ring",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&timer_args, &family_call_ring_timer_) == ESP_OK) {
+        esp_timer_start_once(family_call_ring_timer_,
+                             static_cast<uint64_t>(CONFIG_FAMILY_CALL_RING_TIMEOUT_MS) * 1000ULL);
+    } else {
+        ESP_LOGE(TAG, "Failed to create family call ring timer");
+    }
+}
+
+void Application::StopFamilyCallRingTimer() {
+    if (family_call_ring_timer_ != nullptr) {
+        esp_timer_stop(family_call_ring_timer_);
+        esp_timer_delete(family_call_ring_timer_);
+        family_call_ring_timer_ = nullptr;
+    }
+}
+
+void Application::HandleFamilyCallRingTimeout() {
+    if (family_call_state_ != FamilyCallState::kIncoming) {
+        return;
+    }
+    ESP_LOGW(TAG, "Family call %s ring timeout", family_call_id_.c_str());
+    // Bound aligned with the gateway's pending-call cleanup (60s): after it
+    // the pending call is dead server-side, so give up and ack the failure.
+    EndFamilyCall("timeout");
+}
+
+void Application::ClearFamilyCallState() {
+    if (family_call_state_ == FamilyCallState::kIdle) {
+        return;
+    }
+    ESP_LOGI(TAG, "Family call %s cleared (channel closed)", family_call_id_.c_str());
+    family_call_state_ = FamilyCallState::kIdle;
+    family_call_id_.clear();
+    family_call_announcement_.clear();
+    family_call_pending_announcement_.clear();
+    StopFamilyCallRingTimer();
+}
+
+void Application::EndFamilyCall(const char* ack_error, bool close_channel) {
+    // Runs in the main task. Clears the call phase, acks the call_incoming
+    // failure when the call was still in the ring wait, and closes the audio
+    // channel: the goodbye tells the gateway to release the call bridge.
+    std::string call_id = std::move(family_call_id_);
+    family_call_state_ = FamilyCallState::kIdle;
+    family_call_announcement_.clear();
+    family_call_pending_announcement_.clear();
+    StopFamilyCallRingTimer();
+    if (protocol_ == nullptr) {
+        return;
+    }
+    if (ack_error != nullptr && !call_id.empty()) {
+        protocol_->SendFamilyAck("call_incoming", call_id.c_str(), false, ack_error);
+    }
+    if (close_channel) {
+        protocol_->CloseAudioChannel(true);
+        // The audio-channel-closed callback returns the device to idle.
+    }
+}
+
+void Application::TearDownFamilyCallForSos() {
+    // Runs in the main task, from SendFamilySos. Adjudication B1: the call is
+    // sacrificed for the SOS uplink.
+    bool was_incoming = family_call_state_ == FamilyCallState::kIncoming;
+    ESP_LOGW(TAG, "Family call aborted by SOS (call_id=%s)", family_call_id_.c_str());
+    if (protocol_->ControlPlaneSurvivesChannelClose()) {
+        // MQTT: goodbye releases the gateway call and the broker session
+        // survives. The bridge the gateway may have dropped at call start
+        // only comes back with a fresh hello, so reopen before the uplink.
+        EndFamilyCall(was_incoming ? "rejected" : nullptr, true);
+        if (!protocol_->IsAudioChannelOpened()) {
+            protocol_->OpenAudioChannel();  // best effort; see comment below
+        }
+    } else {
+        // WebSocket: closing the channel would destroy the socket that has to
+        // carry the SOS itself, and a WS deployment has no gateway bridge that
+        // could drop the uplink — clear the state and send over the live
+        // socket as-is.
+        EndFamilyCall(was_incoming ? "rejected" : nullptr, false);
+    }
+}
+
+void Application::RemoteWakeup(const std::string& reason) {
+    // Runs in the main task (MCP tool calls are dispatched there). Issued by
+    // the MQTT gateway for an incoming device call (device-call spec §1/§5).
+    // Same exclusivity as the wake word path: never interrupt a family voice
+    // message recording.
+    if (family_recording_) {
+        ESP_LOGW(TAG, "Remote wakeup ignored: recording a family message");
+        return;
+    }
+    auto state = GetDeviceState();
+    if (state == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonNone);
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+    if (state == kDeviceStateActivating) {
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+    if (state != kDeviceStateIdle) {
+        ESP_LOGW(TAG, "Remote wakeup ignored in state %s",
+                 DeviceStateMachine::GetStateName(state));
+        return;
+    }
+    if (protocol_ == nullptr) {
+        ESP_LOGE(TAG, "Remote wakeup failed: protocol not initialized");
+        return;
+    }
+    if (!SetDeviceState(kDeviceStateConnecting)) {
+        return;
+    }
+    if (protocol_->IsAudioChannelOpened()) {
+        ContinueRemoteWakeup(reason);
+    } else {
+        // Schedule to let the state change be processed first (UI update),
+        // then continue with OpenAudioChannel which may block for ~1 second.
+        Schedule([this, reason]() { ContinueRemoteWakeup(reason); });
+    }
+}
+
+void Application::ContinueRemoteWakeup(const std::string& reason) {
+    // Check state again in case it was changed during scheduling.
+    if (GetDeviceState() != kDeviceStateConnecting) {
+        return;
+    }
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (!protocol_->IsAudioChannelOpened()) {
+        if (!protocol_->OpenAudioChannel()) {
+            SetDeviceState(kDeviceStateIdle);
+            return;
+        }
+    }
+    if (!reason.empty()) {
+        ESP_LOGI(TAG, "Remote wakeup: %s", reason.c_str());
+        // Forward the reason as the wake-word context (listen detect text) so
+        // the server session knows why the device woke up.
+        protocol_->SendWakeWordDetected(reason);
+    }
+    SetListeningMode(GetDefaultListeningMode());
 }

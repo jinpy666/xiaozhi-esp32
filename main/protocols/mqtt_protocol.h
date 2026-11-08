@@ -33,6 +33,10 @@ public:
     bool OpenAudioChannel() override;
     void CloseAudioChannel(bool send_goodbye = true) override;
     bool IsAudioChannelOpened() const override;
+    // MQTT keeps the broker session when the audio channel closes; only the
+    // UDP media path is dropped. Family uplinks (SOS fallback, adjudication
+    // B1) still reach the server after a goodbye.
+    bool ControlPlaneSurvivesChannelClose() const override { return true; }
 
 private:
     // Alive flag for safe scheduled callbacks - set to false in destructor

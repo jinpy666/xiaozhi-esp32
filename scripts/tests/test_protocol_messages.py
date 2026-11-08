@@ -178,12 +178,18 @@ int main() {
               "detect text");
         cJSON_Delete(root);
     }
-    // Pinned current behavior: wake word text is naive-concatenated, so a
-    // double quote produces invalid JSON (documented caveat, not asserted
-    // as desired behavior).
+    // Wake word text is JSON-escaped (the message is built with cJSON since
+    // the remote-wakeup reason / call announcement reuse this path), so a
+    // double quote round-trips instead of producing invalid JSON.
     p.SendWakeWordDetected("a\"b");
-    CHECK(cJSON_Parse(p.sent.back().c_str()) == NULL,
-          "quote in wake word breaks JSON (current behavior pinned)");
+    {
+        cJSON* root = cJSON_Parse(p.sent.back().c_str());
+        cJSON* text = root ? cJSON_GetObjectItem(root, "text") : NULL;
+        CHECK(root != NULL, "quote in wake word escaped to valid JSON");
+        CHECK(cJSON_IsString(text) && std::string(text->valuestring) == "a\"b",
+              "quote round-trips");
+        cJSON_Delete(root);
+    }
 
     // SendMcpMessage: embedded payload parses back
     p.sent.clear();

@@ -68,6 +68,15 @@ struct FamilyLocationFix {
 // not register a provider, in which case no location report is ever sent.
 using FamilyLocationProvider = std::function<FamilyLocationFix()>;
 
+// Device↔device family call phases (device-call spec 2026-11-08 §5,
+// adjudication B1). kIdle → kIncoming: call_incoming presented, waiting for
+// the user's spoken reply (ring timeout bounds the wait). kIncoming →
+// kActive: the user replied by voice (server bridges or rejects; the
+// firmware cannot observe which, and does not need to). Any phase → kIdle:
+// hang-up gesture, ring timeout, goodbye received or the channel closed.
+// All transitions happen in the main task.
+enum class FamilyCallState { kIdle, kIncoming, kActive };
+
 class Application {
 public:
     static Application& GetInstance() {
@@ -142,6 +151,16 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+
+    /**
+     * Remote wakeup issued by the server (MCP user-only tool
+     * self.remote_wakeup, sent by the MQTT gateway for an incoming device
+     * call; device-call spec §1/§5). Idle → open the audio channel and enter
+     * listening with the reason as the wake-word context; Speaking → abort
+     * the speech and return to idle; Activating → return to idle. Must run
+     * in the main task (MCP tool calls are dispatched there).
+     */
+    void RemoteWakeup(const std::string& reason);
     
     /**
      * Reset protocol resources (thread-safe)
@@ -199,6 +218,14 @@ private:
     esp_timer_handle_t family_location_timer_ = nullptr;
     FamilyLocationProvider family_location_provider_;
 
+    // Family device call (device-call spec 2026-11-08 §5, adjudication B1).
+    // All fields below are touched only in the main task.
+    FamilyCallState family_call_state_ = FamilyCallState::kIdle;
+    std::string family_call_id_;
+    std::string family_call_announcement_;          // spoken text; stt echo comparison
+    std::string family_call_pending_announcement_;  // held until the channel opens
+    esp_timer_handle_t family_call_ring_timer_ = nullptr;
+
     bool has_server_time_ = false;
     bool startup_completed_ = false;
     bool pending_startup_wake_word_hint_ = false;
@@ -242,9 +269,24 @@ private:
                                     std::string sender_name);
     void HandleFamilySosAcked(std::string sos_event_id, std::string acked_by_name);
     void HandleFamilyAlarmFire(std::string alarm_id, std::string label, std::string time);
-    void HandleFamilyCallIncoming(std::string call_id);
+    void HandleFamilyCallIncoming(std::string call_id, std::string caller_name);
     void SendFamilyLocationReport();
     static std::string GenerateFamilyMessageId();
+
+    // Family device call (device-call spec §5, adjudication B1)
+    void ContinueRemoteWakeup(const std::string& reason);
+    void InjectFamilyCallAnnouncement(std::string text);
+    void ContinueFamilyCallAnnouncement();
+    void StartFamilyCallRingTimer();
+    void StopFamilyCallRingTimer();
+    void HandleFamilyCallRingTimeout();
+    void ClearFamilyCallState();
+    // Ends the current call phase: clears the state, stops the ring timer,
+    // optionally acks the call_incoming failure (ring wait only) and closes
+    // the audio channel (goodbye releases the gateway call bridge). Set
+    // close_channel=false when closing would destroy the transport that has
+    // to carry a follow-up uplink (WebSocket + SOS).
+    void EndFamilyCall(const char* ack_error, bool close_channel = true);
 
     // Helper methods
     void CheckAssetsVersion();

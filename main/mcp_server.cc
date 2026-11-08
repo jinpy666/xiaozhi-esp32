@@ -141,6 +141,23 @@ void McpServer::AddUserOnlyTools() {
                         return true;
                     });
 
+    // Remote wakeup issued by the MQTT gateway for an incoming device call
+    // (device-call spec 2026-11-08 §1/§5). User-only: invisible to the
+    // on-device model, so it cannot be triggered by voice — only the server
+    // (gateway) can call it. `reason` is optional with an empty default so a
+    // gateway that omits the argument still wakes the device.
+    AddUserOnlyTool(
+        "self.remote_wakeup", "Remote wakeup issued by the server (device call incoming).",
+        PropertyList({Property("reason", kPropertyTypeString,
+                               "Why the device is woken; forwarded to the server as the "
+                               "wake-word context")}),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto reason = properties["reason"].value<std::string>();
+            ESP_LOGI(TAG, "Remote wakeup requested, reason: %s", reason.c_str());
+            Application::GetInstance().RemoteWakeup(reason);
+            return true;
+        });
+
     // Firmware upgrade
     AddUserOnlyTool(
         "self.upgrade_firmware",

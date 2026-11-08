@@ -1293,6 +1293,16 @@ menu "Family Protocol"
         depends on FAMILY_SOS_GPIO >= 0
         help
             How long the SOS button must be held before the alarm fires.
+
+    config FAMILY_CALL_RING_TIMEOUT_MS
+        int "Family Call Ring Timeout (ms)"
+        default 60000
+        range 10000 120000
+        help
+            How long the device waits for the user to answer or reject an
+            incoming family device call before giving up and acking the
+            failure. Keep aligned with the gateway's pending-call cleanup
+            (60 seconds).
 endmenu
 
 endmenu

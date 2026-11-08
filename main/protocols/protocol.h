@@ -62,6 +62,14 @@ public:
     virtual void CloseAudioChannel(bool send_goodbye = true) = 0;
     virtual bool IsAudioChannelOpened() const = 0;
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
+    // Whether the control plane (text uplink) survives CloseAudioChannel():
+    // MQTT keeps the broker session and only drops the UDP audio path, so a
+    // goodbye followed by a family uplink still reaches the server. WebSocket
+    // mode destroys the socket together with the channel, so tearing down
+    // before an uplink would kill the uplink itself (and a WS deployment has
+    // no gateway bridge that could drop it in the first place). Used by the
+    // family-call SOS fallback (device-call spec §5 / adjudication B1).
+    virtual bool ControlPlaneSurvivesChannelClose() const { return false; }
     virtual void SendWakeWordDetected(const std::string& wake_word);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();

@@ -57,6 +57,8 @@ class McpServerTest(unittest.TestCase):
                     void SendMcpMessage(const std::string& payload) {
                         std::cout << "default\t" << payload << '\n';
                     }
+                    // self.remote_wakeup target (device call); no-op on host.
+                    void RemoteWakeup(const std::string&) {}
                     void Reboot() { std::abort(); }
                     bool UpgradeFirmware(const std::string&) { std::abort(); }
                 };
