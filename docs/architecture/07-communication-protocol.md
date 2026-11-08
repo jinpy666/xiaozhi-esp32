@@ -110,6 +110,59 @@ sequenceDiagram
 | custom | payload | 需 `CONFIG_RECEIVE_CUSTOM_MESSAGE` |
 | caption | session_id/seq/source/target/final | 同传字幕（wawabot 扩展）：有译文显示译文、原文换行附后；`target` 空 = 翻译失败只显原文；仅 hello 声明 `features.caption=true`（有显示屏板型）的设备会收到 |
 | goodbye | session_id | MQTT: 匹配则关通道，不回包（防 ping-pong） |
+| family | action（5 action 白名单） | Family 协议（wawabot 扩展），见 §5.3 |
+
+### 5.3 Family 协议（FAMILY-PROTOCOL v1，wawabot 扩展；含设备间通话端）
+
+独立于会话层的 JSON 文本帧 `{"type":"family","action":"..."}`：上行在基类拼
+envelope 后走 `SendText()`（MQTT publish / WS 文本帧），成败**原样传播**
+（protocol.cc:151-227，契约测试 `scripts/tests/test_family_protocol.py`）；下行
+`HandleFamilyJson`（application.cc:1837）按白名单分发。与 hello/listen 共享
+120s 会话空闲判定。
+
+**设备 → 服务器（上行 6 类）**
+
+| action | 结构 | 触发 |
+| --- | --- | --- |
+| sos | message_id, trigger | SOS 按钮 / 通话中兜底（见下） |
+| message_send | message_id, audio_format="opus", audio_b64, duration_ms(数字) | 语音留言录制完成 |
+| location_report | lat, lng, source(gps/wifi/lbs), accuracy_m, [battery_pct] | 周期定时器（无定位源跳过） |
+| message_played | message_id | 留言播放完毕 |
+| ack | ref_action, [ref_id], ok, [error] | call_incoming 等的应答 |
+
+- 三态契约：`battery_pct < 0`（电量未知）与 ack 的 `ref_id`/`error` 为 null 时字段**整体省略**。
+- `message_send` 手工拼 JSON 不走 cJSON：message_id/audio_b64 假定 UUID/base64
+  字母表无需转义；`SendText()` false（WS 音频通道未开 / MQTT broker 断开）→ 返回
+  false，上层播失败音。
+- 下行 5 action 白名单（protocol.cc:131-147）：`message_arrived` / `sos_acked` /
+  `alarm_fire` / `call_incoming` / `ack`；未知/空 action 静默丢弃（为演进预留），
+  无回调注册不崩。
+
+**设备间通话端（device-call spec §5 / 裁决 B1；`FamilyCallState`，application.h:78）**
+
+三态 `kIdle → kIncoming → kActive`，任意态 → kIdle（挂断手势/振铃超时/goodbye/通道关闭，全部在主任务）：
+
+- **来电 kIdle→kIncoming**：`HandleFamilyCallIncoming`（application.cc:1954）——
+  仅 Idle 受理（录音中/通话中忽略）；播报「您收到来自X的来电」（通道未开时挂起，
+  开通道后续播，application.cc:640-642）；启动振铃定时器。
+- **语音应答**：用户回复经 STT echo 对比（application.cc:752-757）：命中播报
+  文本→kActive（server 桥接与否固件不可见也无需可见）；不命中→ack `rejected` 挂断。
+- **振铃超时**：`FAMILY_CALL_RING_TIMEOUT_MS`（main/Kconfig.projbuild:1297，默认
+  60s，range 10-120s，对齐网关 pending-call 清理）→ ack `timeout` 放弃
+  （application.cc:2092-2100）；非 kIncoming 态超时忽略。
+- **remote_wakeup**：server-only MCP 工具 `self.remote_wakeup`（mcp_server.cc:149，
+  AddUserOnlyTools——用户不可口喊触发）；Idle→开音频通道进监听（reason 作唤醒
+  上下文）、Speaking→打断回 Idle、其余态忽略（application.cc:2157）。
+- **挂断手势**：通话态短按 chat 键 = kIncoming 拒接（ack rejected）/ kActive 挂断
+  （goodbye）（application.cc:928-932）；SOS 长按在专用 SOS 键
+  （CONFIG_FAMILY_SOS_GPIO），互不影响，板级零改动。
+- **通话中 SOS 兜底（裁决 B1 硬项）**：网关通话模式会断主叫 bridge，且无 bridge
+  的控制上行被丢弃（spec §5 证据 `app.js:1148`/`app.js:529-536`）→
+  `TearDownFamilyCallForSos`（application.cc:2135）按
+  `ControlPlaneSurvivesChannelClose()`（MQTT override true / 基类 WS 默认 false）
+  分两支：**MQTT**——goodbye 拆桥释放网关呼叫→通道未开则重开（新 hello 重建
+  bridge）→再发 SOS；**WS**——拆桥即毁 socket 且 WS 无网关 bridge，故不拆、清态
+  后活 socket 直发。SOS 到达率优先于通话延续。
 
 ## 6. 超时 / 重连规则表
 
@@ -121,6 +174,7 @@ sequenceDiagram
 | WebSocket 断 | **无自动重连**；下次按键/唤醒重走 OpenAudioChannel，失败回 Idle | websocket_protocol.cc:172-177; application.cc:835-855 |
 | 物理网络断 | `MAIN_EVENT_NETWORK_DISCONNECTED` → 连接/监听/说话态关通道 | application.cc:325-340 |
 | WS Ping | Pong 经 Schedule 在主任务回（4G AT 任务不能直接发） | websocket_protocol.cc:161-170 |
+| 家庭通话振铃 | `FAMILY_CALL_RING_TIMEOUT_MS`（默认 60s，对齐网关 pending-call 清理）内未应答 → ack `timeout` 放弃；非 Incoming 态超时忽略 | application.cc:2092-2100; Kconfig.projbuild:1297 |
 
 ## 7. 改协议的注意事项
 

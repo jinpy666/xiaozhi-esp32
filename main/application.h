@@ -281,6 +281,11 @@ private:
     void StopFamilyCallRingTimer();
     void HandleFamilyCallRingTimeout();
     void ClearFamilyCallState();
+    // SOS fallback (device-call spec §5, adjudication B1): sacrifice the call
+    // phase before the SOS uplink, choosing per transport whether the audio
+    // channel is torn down first (MQTT rebuilds the bridge with a fresh
+    // hello; WebSocket would destroy the socket that carries the uplink).
+    void TearDownFamilyCallForSos();
     // Ends the current call phase: clears the state, stops the ring timer,
     // optionally acks the call_incoming failure (ring wait only) and closes
     // the audio channel (goodbye releases the gateway call bridge). Set
